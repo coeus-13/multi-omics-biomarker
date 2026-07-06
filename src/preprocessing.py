@@ -1,8 +1,8 @@
 """
 preprocessing.py
 ================
-Production-ready, memory-optimized genomics preprocessing pipeline for
-TCGA-BRCA RNA-Seq expression data.
+Production-ready, memory-optimized genomics preprocessing pipeline
+for TCGA-BRCA RNA-Seq expression data.
 
 Implements a 4-stage, leakage-free sklearn Pipeline:
     1. Log2(FPKM + 1) variance-stabilizing transform
@@ -12,32 +12,48 @@ Implements a 4-stage, leakage-free sklearn Pipeline:
 
 Consumes the (X, y) output of src/data_ingestion.py directly.
 
-Memory Budget (continuing from data_ingestion.py, ~880 training samples):
-    Input X_train (880 x ~60,000 genes, float32)      : ~200 MB
-    Post low-expression filter (880 x ~20,000 genes)   : ~67 MB
-    Post VarianceThreshold (880 x ~15,000 genes)       : ~50 MB
-    Final scaled output                                : ~50 MB
+BUG FIX -- LowExpressionFilter.transform()
+--------------------------------------------
+A prior revision of this file had transform()'s type and column
+checks stripped of their `if` guards, leaving two unconditional
+`raise` statements that fired on every call regardless of input
+type -- producing a "requires a DataFrame; got DataFrame" message.
+This was not an sklearn set_output wrapping issue; set_output hands
+real pandas.DataFrame objects between pipeline steps. The fix
+restores proper `isinstance` guards (see LowExpressionFilter). A
+best-effort array-like -> DataFrame coercion was added to
+transform() specifically, since it already has feature_names_in_
+from a prior fit() to recover gene names from. fit() intentionally
+stays strict with no coercion -- see that class's docstring.
+
+Memory Budget (continuing from data_ingestion.py, ~880 samples):
+    Input X_train (880 x ~60,000 genes, float32)    : ~200 MB
+    Post low-expression filter (880 x ~20,000 genes) : ~67 MB
+    Post VarianceThreshold (880 x ~15,000 genes)     : ~50 MB
+    Final scaled output                              : ~50 MB
 
 Optimization Techniques Used:
-    1. Every transform() is a single vectorized NumPy ufunc/reduction call -
-       zero Python-level loops over genes or samples.
-    2. float32 enforced at every stage via explicit casts, mirroring the
-       safety-net pattern in TCGADataIngester._enforce_float32().
-    3. Feature masks are boolean NumPy arrays applied via pandas .loc - a
-       single vectorized indexing operation, not iterative filtering.
-    4. set_output(transform="pandas") is applied surgically only to the two
-       sklearn built-in steps that need it (VarianceThreshold, StandardScaler).
-       The custom steps already construct DataFrames manually.
+    1. Every transform() is a single vectorized NumPy call -- zero
+       Python-level loops over genes or samples.
+    2. float32 enforced at every stage via explicit casts, mirroring
+       the safety-net pattern in TCGADataIngester._enforce_float32().
+    3. Feature masks are boolean NumPy arrays applied via pandas
+       .loc -- a single vectorized indexing operation.
+    4. set_output(transform="pandas") is applied surgically only to
+       the two sklearn built-in steps that need it (VarianceThreshold,
+       StandardScaler). The custom steps construct DataFrames by hand.
 
 Leakage Prevention:
-    All stateful steps (LowExpressionFilter, VarianceThreshold, StandardScaler)
-    learn their statistics EXCLUSIVELY inside .fit()/.fit_transform(), which
-    must only ever be called on the training split. .transform() reuses those
-    learned statistics verbatim - see GenomicsPreprocessor docstrings.
+    All stateful steps (LowExpressionFilter, VarianceThreshold,
+    StandardScaler) learn their statistics EXCLUSIVELY inside
+    .fit()/.fit_transform(), called only on the training split.
+    .transform() reuses those learned statistics verbatim.
 
 Usage:
     >>> from src.data_ingestion import TCGADataIngester
-    >>> from src.preprocessing import GenomicsPreprocessor, encode_pam50_labels
+    >>> from src.preprocessing import (
+    ...     GenomicsPreprocessor, encode_pam50_labels
+    ... )
     >>> from sklearn.model_selection import train_test_split
     >>>
     >>> X, y, _ = TCGADataIngester(data_dir="data/raw/").run()
@@ -73,9 +89,7 @@ from src.data_ingestion import MemoryReporter
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration Dataclass
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Configuration Dataclass ──
 
 
 @dataclass
@@ -83,24 +97,20 @@ class PreprocessingConfig:
     """
     Configuration for the genomics preprocessing pipeline.
 
-    Mirrors the IngestionConfig pattern from data_ingestion.py: a typed
-    dataclass injected into the orchestrator class, making every threshold
-    explicit, IDE-autocompletable, and trivially swappable in unit tests.
-
     Attributes:
         log_pseudocount: Pseudocount added before log2 transform.
-        min_expression: Minimum log2(FPKM+1) value to count a gene as
-            "expressed" in a sample. 1.0 (raw FPKM >= 1) is a standard
-            cutoff used broadly across TCGA/GTEx differential-expression
+        min_expression: Minimum log2(FPKM+1) value to count a gene
+            as "expressed" in a sample. 1.0 (raw FPKM >= 1) is a
+            standard cutoff in TCGA/GTEx differential-expression
             literature.
-        min_sample_fraction: Minimum fraction of samples a gene must be
-            "expressed" in to survive filtering.
-        variance_threshold: Minimum feature variance to retain a gene.
-            Kept at 0.1 to match the original project roadmap's Step 3.
+        min_sample_fraction: Minimum fraction of samples a gene must
+            be "expressed" in to survive filtering.
+        variance_threshold: Minimum feature variance to retain a
+            gene.
         with_mean: Whether StandardScaler centers data to zero mean.
-        with_std: Whether StandardScaler scales data to unit variance.
-        low_memory_mode: If True, adds extra memory instrumentation logging,
-            mirroring IngestionConfig.low_memory_mode.
+        with_std: Whether StandardScaler scales to unit variance.
+        low_memory_mode: If True, adds extra memory instrumentation
+            logging, mirroring IngestionConfig.low_memory_mode.
     """
 
     log_pseudocount: float = 1.0
@@ -112,26 +122,22 @@ class PreprocessingConfig:
     low_memory_mode: bool = True
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Custom Transformer 1: Log2 Variance Stabilization
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Custom Transformer 1: Log2 Variance Stabilization ──
 
 
 class Log2FPKMTransformer(BaseEstimator, TransformerMixin):
     """
-    Applies a log2(x + pseudocount) variance-stabilizing transform to
-    RNA-Seq FPKM expression values.
+    Applies a log2(x + pseudocount) variance-stabilizing transform
+    to RNA-Seq FPKM expression values.
 
-    RNA-Seq FPKM/FPKM-UQ values are right-skewed with variance that scales
-    with the mean. A small number of highly-expressed housekeeping genes
-    can dominate Euclidean-distance-based models (SVM, KNN) and violate the
-    approximate-Gaussian assumption StandardScaler relies on. log2(x + 1)
-    is the standard variance-stabilizing transform used across TCGA/GTEx.
+    RNA-Seq FPKM/FPKM-UQ values are right-skewed with variance that
+    scales with the mean. log2(x + 1) is the standard variance-
+    stabilizing transform used across TCGA/GTEx.
 
-    This transformer is stateless with respect to the data (no per-gene
-    statistics are learned), but still implements the full
-    BaseEstimator/TransformerMixin contract - including get_feature_names_out
-    - so it composes correctly inside a sklearn Pipeline.
+    Stateless with respect to the data (no per-gene statistics are
+    learned), but still implements the full BaseEstimator /
+    TransformerMixin contract -- including get_feature_names_out --
+    so it composes correctly inside a sklearn Pipeline.
 
     Attributes:
         feature_names_in_: Gene identifiers seen during fit.
@@ -145,19 +151,21 @@ class Log2FPKMTransformer(BaseEstimator, TransformerMixin):
         self, X: pd.DataFrame, y: Optional[pd.Series] = None
     ) -> "Log2FPKMTransformer":
         """
-        Validate input and record feature names. No statistics are learned -
-        the log transform is a fixed, parameter-free function.
+        Validate input and record feature names. No statistics are
+        learned -- the log transform is a fixed, parameter-free
+        function.
 
         Args:
-            X: Raw (non-negative) FPKM expression values, shape (n_samples, n_genes).
-            y: Ignored. Present for sklearn Pipeline API compatibility.
+            X: Raw (non-negative) FPKM values, shape (n_samples,
+                n_genes).
+            y: Ignored. Present for sklearn Pipeline compatibility.
 
         Returns:
             self
 
         Raises:
             TypeError: If X is not a pandas DataFrame.
-            ValueError: If X contains negative values or NaN values.
+            ValueError: If X contains negative or NaN values.
         """
         self._validate_input(X, context="fit")
         self.feature_names_in_ = np.asarray(X.columns)
@@ -166,32 +174,32 @@ class Log2FPKMTransformer(BaseEstimator, TransformerMixin):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply log2(X + pseudocount) using a single vectorized NumPy call.
+        Apply log2(X + pseudocount) via a single vectorized call.
 
-        Performance note: this executes as ONE C-level NumPy ufunc pass
-        over the full (n_samples x n_genes) matrix. The anti-pattern
-        `X.applymap(lambda v: np.log2(v + 1))` iterates at the Python
-        level over every individual cell and is 100-1000x slower on a
-        matrix this wide; it is never used here.
+        Performance note: this executes as ONE C-level NumPy ufunc
+        pass over the full (n_samples x n_genes) matrix. The anti-
+        pattern `X.applymap(lambda v: np.log2(v + 1))` iterates at
+        the Python level over every cell and is 100-1000x slower; it
+        is never used here.
 
         Args:
             X: DataFrame of shape (n_samples, n_genes).
 
         Returns:
-            DataFrame of shape (n_samples, n_genes), dtype float32, with
+            DataFrame of shape (n_samples, n_genes), float32, with
             the original index and column names preserved.
 
         Raises:
             NotFittedError: If called before fit().
-            ValueError: If X's columns don't match the genes seen during fit.
+            ValueError: If X's columns don't match fit()'s genes.
         """
         check_is_fitted(self)
         self._validate_input(X, context="transform")
         self._validate_feature_alignment(X)
 
-        # Single vectorized ufunc call - see performance note above.
-        # Explicit float32 cast guards against silent float64 promotion
-        # from the Python-float pseudocount on some NumPy versions.
+        # Single vectorized ufunc call -- see performance note
+        # above. Explicit float32 cast guards against silent
+        # float64 promotion from the Python-float pseudocount.
         log_values = np.log2(
             X.to_numpy(dtype=np.float32) + np.float32(self.pseudocount)
         )
@@ -203,7 +211,7 @@ class Log2FPKMTransformer(BaseEstimator, TransformerMixin):
         )
 
     def get_feature_names_out(self, input_features=None) -> np.ndarray:
-        """Return gene names unchanged - this step drops no columns."""
+        """Return gene names unchanged -- this step drops no columns."""
         check_is_fitted(self)
         return self.feature_names_in_
 
@@ -211,69 +219,87 @@ class Log2FPKMTransformer(BaseEstimator, TransformerMixin):
     def _validate_input(X, context: str) -> None:
         if not isinstance(X, pd.DataFrame):
             raise TypeError(
-                f"Log2FPKMTransformer.{context}() requires a pandas DataFrame "
-                f"(to preserve gene name columns through the pipeline); got {type(X)}."
+                f"Log2FPKMTransformer.{context}() requires a "
+                "pandas DataFrame (to preserve gene name columns "
+                f"through the pipeline); got {type(X)}."
             )
         if X.isnull().values.any():
             raise ValueError(
-                f"Input to Log2FPKMTransformer.{context}() contains NaN values. "
-                f"Resolve upstream in data_ingestion before preprocessing."
+                f"Input to Log2FPKMTransformer.{context}() "
+                "contains NaN values. Resolve upstream in "
+                "data_ingestion before preprocessing."
             )
         if (X.to_numpy() < 0).any():
             raise ValueError(
-                f"Input to Log2FPKMTransformer.{context}() contains negative "
-                f"values, which is invalid for FPKM expression data."
+                f"Input to Log2FPKMTransformer.{context}() "
+                "contains negative values, which is invalid for "
+                "FPKM expression data."
             )
 
     def _validate_feature_alignment(self, X: pd.DataFrame) -> None:
         if not np.array_equal(np.asarray(X.columns), self.feature_names_in_):
             raise ValueError(
-                "Column mismatch: X passed to transform() has different genes "
-                "than were seen during fit(). This usually means train/test "
-                "gene panels are misaligned - verify both came from the same "
+                "Column mismatch: X passed to transform() has "
+                "different genes than were seen during fit(). "
+                "This usually means train/test gene panels are "
+                "misaligned -- verify both came from the same "
                 "TCGADataIngester run."
             )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Custom Transformer 2: Low-Expression Gene Filter
-# ──────────────────────────────────────────────────────────────────────────────
+Log2FPKMTransformer.__module__ = "src.preprocessing"
+
+# ── Custom Transformer 2: Low-Expression Gene Filter ──
 
 
 class LowExpressionFilter(BaseEstimator, TransformerMixin):
     """
-    Removes genes that are not meaningfully expressed across the cohort.
+    Removes genes that are not meaningfully expressed across the
+    cohort.
 
-    A gene is retained only if its log2(FPKM+1) value reaches at least
-    min_expression in at least min_sample_fraction of training samples.
-    Genes failing this bar are overwhelmingly sequencing noise / biological
-    dropout, and removing them BEFORE VarianceThreshold/StandardScaler
-    prevents these near-zero columns from being z-scored into spurious
-    unit-variance noise.
+    A gene is retained only if its log2(FPKM+1) value reaches at
+    least min_expression in at least min_sample_fraction of
+    training samples. Removing these BEFORE VarianceThreshold /
+    StandardScaler prevents near-zero columns from being z-scored
+    into spurious unit-variance noise.
 
     Leakage Prevention:
-        The expressed-gene mask is learned EXCLUSIVELY from the data passed
-        to .fit() (the training fold). The identical mask - not a
-        re-computed one - is applied in .transform(), including to held-out
-        test data. This is what makes the transformer safe to use inside
-        cross_val_score / GridSearchCV without leaking test-set statistics.
+        The expressed-gene mask is learned EXCLUSIVELY from the data
+        passed to .fit() (the training fold). The identical mask --
+        not a re-computed one -- is applied in .transform().
+
+    Type Handling:
+        fit() requires a genuine pandas DataFrame and does NOT
+        coerce array-like input. Gene identity must be established
+        authoritatively at fit time, since every downstream step
+        (SHAP gene attribution, biomarker cross-referencing) depends
+        on feature_names_in_ being real gene symbols rather than
+        synthetic integer positions.
+
+        transform(), by contrast, already knows the expected gene
+        names from a prior fit() call, so it makes a best-effort
+        recovery via _coerce_to_dataframe() if X arrives as a bare
+        array-like object rather than a DataFrame. If the recovered
+        shape doesn't match feature_names_in_, the column-alignment
+        check right after still raises a clear ValueError rather
+        than silently mislabeling genes.
 
     Design note: this class deliberately does NOT subclass sklearn's
-    internal SelectorMixin (sklearn.feature_selection._base.SelectorMixin).
-    That class lives in a private module (leading underscore) not covered
-    by sklearn's semver compatibility guarantees. get_feature_names_out()
-    is implemented explicitly by hand instead, so this transformer is
-    resilient to future sklearn internal refactors.
+    internal SelectorMixin (sklearn.feature_selection._base.
+    SelectorMixin) -- that module has no semver guarantee.
+    get_feature_names_out() is implemented by hand instead.
 
     Attributes:
-        support_mask_: Boolean array, True for genes retained after fitting.
-        feature_names_in_: Gene identifiers seen during fit (pre-filter set).
-        n_features_in_: Number of genes seen during fit (pre-filter).
+        support_mask_: Boolean array, True for genes retained.
+        feature_names_in_: Gene identifiers seen during fit.
+        n_features_in_: Number of genes seen during fit.
         n_genes_removed_: Count of genes dropped by the filter.
     """
 
     def __init__(
-        self, min_expression: float = 1.0, min_sample_fraction: float = 0.2
+        self,
+        min_expression: float = 1.0,
+        min_sample_fraction: float = 0.2,
     ) -> None:
         self.min_expression = min_expression
         self.min_sample_fraction = min_sample_fraction
@@ -284,15 +310,16 @@ class LowExpressionFilter(BaseEstimator, TransformerMixin):
         """
         Learn the gene-retention mask from training data only.
 
-        Vectorization note: the mask is computed via two NumPy reduction
-        passes over the full matrix - a boolean comparison
-        (n_samples x n_genes) followed by a single column-wise mean(axis=0)
-        - both executed in compiled C code. This avoids the anti-pattern of
-        looping `for gene in X.columns: X[gene].mean()`, which would issue
-        60,000 separate Python-level pandas calls.
+        Intentionally strict on input type -- see the class
+        docstring's "Type Handling" section.
+
+        Vectorization note: the mask is computed via two NumPy
+        reduction passes over the full matrix, both in compiled C
+        code -- never a Python-level loop over genes.
 
         Args:
-            X: Log2-transformed expression values, training fold only.
+            X: Log2-transformed values, training fold only. Must be
+                a genuine pandas DataFrame.
             y: Ignored.
 
         Returns:
@@ -300,28 +327,26 @@ class LowExpressionFilter(BaseEstimator, TransformerMixin):
 
         Raises:
             TypeError: If X is not a pandas DataFrame.
-            ValueError: If min_sample_fraction is outside [0, 1], or if
-                zero genes survive the filter (min_expression too strict).
+            ValueError: If min_sample_fraction is outside [0, 1], or
+                zero genes survive the filter.
         """
         if not isinstance(X, pd.DataFrame):
             raise TypeError(
-                f"LowExpressionFilter.fit() requires a pandas DataFrame; got {type(X)}."
+                "LowExpressionFilter.fit() requires a pandas "
+                f"DataFrame; got {type(X)}."
             )
         if not 0.0 <= self.min_sample_fraction <= 1.0:
             raise ValueError(
-                f"min_sample_fraction must be in [0, 1]; "
-                f"got {self.min_sample_fraction}."
+                "min_sample_fraction must be in [0, 1]; got "
+                f"{self.min_sample_fraction}."
             )
 
         self.feature_names_in_ = np.asarray(X.columns)
         self.n_features_in_ = X.shape[1]
 
-        # ── Vectorized mask computation (no Python-level loop) ───────────
         values = X.to_numpy(dtype=np.float32)
-        expressed_mask = values >= np.float32(
-            self.min_expression
-        )  # (n_samples, n_genes)
-        fraction_expressed = expressed_mask.mean(axis=0)  # (n_genes,)
+        expressed_mask = values >= np.float32(self.min_expression)
+        fraction_expressed = expressed_mask.mean(axis=0)
         self.support_mask_ = fraction_expressed >= self.min_sample_fraction
 
         n_retained = int(self.support_mask_.sum())
@@ -329,15 +354,18 @@ class LowExpressionFilter(BaseEstimator, TransformerMixin):
 
         if n_retained == 0:
             raise ValueError(
-                f"LowExpressionFilter removed all {self.n_features_in_} genes. "
-                f"min_expression={self.min_expression} is likely too strict - "
-                f"verify X is log2-transformed, and consider lowering "
-                f"min_expression or min_sample_fraction."
+                "LowExpressionFilter removed all "
+                f"{self.n_features_in_} genes. "
+                f"min_expression={self.min_expression} is likely "
+                "too strict -- verify X is log2-transformed, and "
+                "consider lowering min_expression or "
+                "min_sample_fraction."
             )
 
         logger.info(
-            "LowExpressionFilter fit | Retained %d / %d genes (%.1f%%) | "
-            "min_expression=%.2f, min_sample_fraction=%.2f",
+            "LowExpressionFilter fit | Retained %d / %d genes "
+            "(%.1f%%) | min_expression=%.2f, "
+            "min_sample_fraction=%.2f",
             n_retained,
             self.n_features_in_,
             100 * n_retained / self.n_features_in_,
@@ -346,33 +374,82 @@ class LowExpressionFilter(BaseEstimator, TransformerMixin):
         )
         return self
 
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, X) -> pd.DataFrame:
         """
-        Apply the mask learned during fit() - no re-computation on X.
+        Apply the mask learned during fit() -- no recomputation.
 
         Args:
-            X: Must have the exact same genes (columns) seen during fit().
+            X: Same genes (columns) seen during fit(), as a
+                DataFrame, or array-like with a matching column
+                count (see _coerce_to_dataframe()).
 
         Returns:
             DataFrame of shape (n_samples, n_retained_genes).
 
         Raises:
             NotFittedError: If called before fit().
-            ValueError: If X's columns don't match those seen during fit().
+            TypeError: If X cannot be interpreted as 2D array-like.
+            ValueError: If X's columns don't match those from fit().
         """
         check_is_fitted(self)
-        raise TypeError(
-            "LowExpressionFilter.transform() requires a pandas DataFrame; "
-            f"got {type(X)}."
-        )
-        raise ValueError(
-            "Column mismatch: X passed to transform() has different genes "
-            "than were seen during fit(). Train/test gene panels must "
-            "match exactly."
-        )
 
-        # Vectorized boolean column selection - single pandas operation, no loop.
+        if not isinstance(X, pd.DataFrame):
+            X = self._coerce_to_dataframe(X)
+
+        if not np.array_equal(np.asarray(X.columns), self.feature_names_in_):
+            raise ValueError(
+                "Column mismatch: X passed to transform() has "
+                "different genes than were seen during fit(). "
+                "Train/test gene panels must match exactly."
+            )
+
+        # Vectorized boolean column selection -- single pandas
+        # operation, no loop.
         return X.loc[:, self.support_mask_]
+
+    def _coerce_to_dataframe(self, X) -> pd.DataFrame:
+        """
+        Best-effort recovery when X arrives as an array-like object
+        instead of a pandas DataFrame.
+
+        Reattaches the gene-symbol columns learned during fit() when
+        the shape matches. If the shape doesn't match, columns are
+        left as pandas' default integer labels and the caller's
+        column-alignment check raises a clear ValueError rather than
+        silently mislabeling genes.
+
+        Args:
+            X: Array-like object (e.g. a numpy ndarray).
+
+        Returns:
+            pd.DataFrame wrapping X.
+
+        Raises:
+            TypeError: If X has no discoverable column count.
+        """
+        try:
+            n_features = X.shape[1]
+        except (AttributeError, IndexError) as exc:
+            raise TypeError(
+                "LowExpressionFilter.transform() requires a pandas "
+                "DataFrame or a 2D array-like object; could not "
+                f"determine column count from {type(X)}."
+            ) from exc
+
+        if n_features == len(self.feature_names_in_):
+            columns = self.feature_names_in_
+            note = " with recovered gene names"
+        else:
+            columns = None
+            note = ""
+
+        logger.warning(
+            "LowExpressionFilter.transform() received a non-"
+            "DataFrame input (%s). Coercing to pandas.DataFrame%s.",
+            type(X).__name__,
+            note,
+        )
+        return pd.DataFrame(X, columns=columns)
 
     def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """Return the subset of gene names that survived filtering."""
@@ -380,39 +457,29 @@ class LowExpressionFilter(BaseEstimator, TransformerMixin):
         return self.feature_names_in_[self.support_mask_]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Orchestrator: Assembles and Owns the Full sklearn Pipeline
-# ──────────────────────────────────────────────────────────────────────────────
+LowExpressionFilter.__module__ = "src.preprocessing"
+
+# ── Orchestrator: Assembles and Owns the Full sklearn Pipeline ──
 
 
 class GenomicsPreprocessor:
     """
-    Orchestrates the 4-stage genomics preprocessing pipeline:
-        1. Log2(FPKM + 1) variance-stabilizing transform
-        2. Low-expression gene filtering (noise removal)
-        3. VarianceThreshold (drops zero/near-zero-variance genes)
-        4. StandardScaler (zero mean, unit variance)
+    Orchestrates the 4-stage genomics preprocessing pipeline.
 
-    Internally builds and owns a single sklearn.pipeline.Pipeline so calling
-    code gets sklearn-native behavior (fit/transform, compatibility with
-    cross_val_score, GridSearchCV, joblib serialization) "for free," while
-    this class adds genomics-specific logging, memory instrumentation, and
-    a convenience accessor for surviving gene names (needed downstream for
-    SHAP biomarker mapping).
+    Internally builds and owns a single sklearn.pipeline.Pipeline so
+    calling code gets sklearn-native behavior for free, while this
+    class adds genomics-specific logging, memory instrumentation,
+    and a gene-name accessor for downstream SHAP mapping.
 
     Why label encoding is NOT part of this class:
-        sklearn.pipeline.Pipeline.transform() operates on X only - mixing y
-        label-encoding into an X-only Pipeline is a common anti-pattern that
-        silently breaks the moment the pipeline is used inside
-        cross_val_score or GridSearchCV, both of which assume a Pipeline
-        transforms X and nothing else. Label encoding is handled by the
-        standalone encode_pam50_labels() function in this module instead.
+        Mixing y label-encoding into an X-only Pipeline silently
+        breaks the moment the pipeline is used inside
+        cross_val_score or GridSearchCV. Label encoding is handled
+        by the standalone encode_pam50_labels() function instead.
 
     Attributes:
-        config: PreprocessingConfig instance controlling all thresholds.
-        pipeline_: Set after the first call to fit_transform(). Use this
-            directly for joblib serialization or sklearn CV utilities if
-            you don't need the convenience wrappers below.
+        config: PreprocessingConfig instance controlling thresholds.
+        pipeline_: Set after the first fit_transform() call.
     """
 
     def __init__(self, config: Optional[PreprocessingConfig] = None) -> None:
@@ -421,8 +488,9 @@ class GenomicsPreprocessor:
         self.pipeline_: Optional[Pipeline] = None
 
         logger.info(
-            "GenomicsPreprocessor initialized | min_expression=%.2f | "
-            "min_sample_fraction=%.2f | variance_threshold=%.2f",
+            "GenomicsPreprocessor initialized | min_expression="
+            "%.2f | min_sample_fraction=%.2f | "
+            "variance_threshold=%.2f",
             self.config.min_expression,
             self.config.min_sample_fraction,
             self.config.variance_threshold,
@@ -434,62 +502,60 @@ class GenomicsPreprocessor:
 
         Only the two sklearn built-in steps (VarianceThreshold,
         StandardScaler) need explicit set_output(transform="pandas")
-        configuration - they return bare ndarrays by default. Our custom
-        transformers above always construct and return a pandas DataFrame
-        directly inside their own transform() methods, so no output-
-        container configuration is needed for them.
+        -- they return bare ndarrays by default. The custom
+        transformers already construct DataFrames manually.
 
         Returns:
-            An unfitted sklearn.pipeline.Pipeline. Every stage emits a
-            pandas DataFrame with correct gene-name columns end-to-end.
+            An unfitted Pipeline. Every stage emits a DataFrame with
+            correct gene-name columns end-to-end.
         """
         variance_filter = VarianceThreshold(threshold=self.config.variance_threshold)
         variance_filter.set_output(transform="pandas")
 
         scaler = StandardScaler(
-            with_mean=self.config.with_mean, with_std=self.config.with_std
+            with_mean=self.config.with_mean,
+            with_std=self.config.with_std,
         )
         scaler.set_output(transform="pandas")
 
+        log2_step = Log2FPKMTransformer(pseudocount=self.config.log_pseudocount)
+        low_expr_step = LowExpressionFilter(
+            min_expression=self.config.min_expression,
+            min_sample_fraction=self.config.min_sample_fraction,
+        )
+
         return Pipeline(
             steps=[
-                (
-                    "log2_transform",
-                    Log2FPKMTransformer(pseudocount=self.config.log_pseudocount),
-                ),
-                (
-                    "low_expression_filter",
-                    LowExpressionFilter(
-                        min_expression=self.config.min_expression,
-                        min_sample_fraction=self.config.min_sample_fraction,
-                    ),
-                ),
+                ("log2_transform", log2_step),
+                ("low_expression_filter", low_expr_step),
                 ("variance_threshold", variance_filter),
                 ("scaler", scaler),
             ]
         )
 
     def fit_transform(
-        self, X_train: pd.DataFrame, y_train: Optional[pd.Series] = None
+        self,
+        X_train: pd.DataFrame,
+        y_train: Optional[pd.Series] = None,
     ) -> pd.DataFrame:
         """
         Fit the pipeline on training data ONLY, then transform it.
 
-        This is the single point in the entire workflow where any
-        statistic (expression mask, variance mask, scaler mean/std) is
-        learned. Call this exactly once, on the training split.
+        This is the single point where any statistic (expression
+        mask, variance mask, scaler mean/std) is learned. Call this
+        exactly once, on the training split.
 
         Args:
             X_train: Raw FPKM expression matrix, training fold only.
-            y_train: Ignored. Accepted for sklearn API symmetry; every
-                step in this pipeline is unsupervised.
+            y_train: Ignored. Accepted for sklearn API symmetry.
 
         Returns:
-            DataFrame of shape (n_train_samples, n_selected_genes), float32,
-            zero-mean/unit-variance, ready for SVM / KNN / Tree-based models.
+            DataFrame, shape (n_train, n_selected_genes), float32,
+            zero-mean/unit-variance.
         """
         logger.info(
-            "GenomicsPreprocessor.fit_transform() START | Input: %s", X_train.shape
+            "GenomicsPreprocessor.fit_transform() START | Input: %s",
+            X_train.shape,
         )
         self.reporter.report(X_train, "Preprocessing Input (raw FPKM, train fold)")
 
@@ -499,7 +565,8 @@ class GenomicsPreprocessor:
 
         self.reporter.report(X_processed, "Preprocessing Output (scaled, train fold)")
         logger.info(
-            "GenomicsPreprocessor.fit_transform() COMPLETE | %d -> %d genes retained",
+            "GenomicsPreprocessor.fit_transform() COMPLETE | "
+            "%d -> %d genes retained",
             X_train.shape[1],
             X_processed.shape[1],
         )
@@ -507,25 +574,24 @@ class GenomicsPreprocessor:
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply the already-fitted pipeline to new data (validation/test/inference).
+        Apply the already-fitted pipeline to new data.
 
-        Reuses every statistic learned in fit_transform() - no re-fitting,
-        no re-computation of masks or scaler parameters. This is what
-        guarantees zero test-set leakage.
+        Reuses every statistic learned in fit_transform() -- no
+        re-fitting, guaranteeing zero test-set leakage.
 
         Args:
             X: Must contain the exact same gene columns as X_train.
 
         Returns:
-            DataFrame of shape (n_samples, n_selected_genes), float32.
+            DataFrame of shape (n_samples, n_selected_genes).
 
         Raises:
             RuntimeError: If called before fit_transform().
         """
         if self.pipeline_ is None:
             raise RuntimeError(
-                "GenomicsPreprocessor.transform() called before fit_transform(). "
-                "Fit on the training split first."
+                "GenomicsPreprocessor.transform() called before "
+                "fit_transform(). Fit on the training split first."
             )
         logger.info("GenomicsPreprocessor.transform() | Input: %s", X.shape)
         X_processed = self.pipeline_.transform(X)
@@ -535,12 +601,10 @@ class GenomicsPreprocessor:
 
     def get_selected_genes(self) -> List[str]:
         """
-        Return the final gene names that survived the full pipeline (post
-        log-transform, low-expression filter, AND variance threshold).
+        Return the final gene names surviving the full pipeline.
 
-        This is the exact gene list to pass as feature_names into SHAP's
-        summary_plot/beeswarm calls later - keeping SHAP gene labels
-        perfectly in sync with what the model actually saw.
+        Pass this directly as feature_names into SHAP calls so
+        labels stay in sync with what the model actually saw.
 
         Returns:
             List of surviving gene identifiers.
@@ -556,13 +620,9 @@ class GenomicsPreprocessor:
         """
         Serialize the fitted pipeline to disk via joblib.
 
-        Use this exact artifact at inference time in deployment/api/main.py
-        so the FastAPI service applies IDENTICAL preprocessing to incoming
-        samples as was used during training - a common source of
-        train/serve skew if reimplemented separately.
-
         Args:
-            path: Destination path, e.g. "models/preprocessing_pipeline.joblib".
+            path: Destination path, e.g.
+                'models/preprocessing_pipeline.joblib'.
 
         Raises:
             RuntimeError: If called before fit_transform().
@@ -576,14 +636,13 @@ class GenomicsPreprocessor:
     @classmethod
     def load(cls, path: str) -> "GenomicsPreprocessor":
         """
-        Reconstruct a GenomicsPreprocessor from a previously saved pipeline.
+        Reconstruct a GenomicsPreprocessor from a saved pipeline.
 
         Args:
             path: Path to a .joblib file written by save().
 
         Returns:
-            GenomicsPreprocessor with .pipeline_ populated and ready for
-            .transform() calls (fit_transform() should NOT be called again).
+            GenomicsPreprocessor with .pipeline_ populated.
         """
         instance = cls()
         instance.pipeline_ = joblib.load(path)
@@ -592,20 +651,21 @@ class GenomicsPreprocessor:
 
     def _enforce_float32(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Safety-net downcast mirroring TCGADataIngester._enforce_float32().
+        Safety-net downcast mirroring
+        TCGADataIngester._enforce_float32().
 
-        sklearn's internal numerical routines (e.g., StandardScaler's
-        variance computation) may upcast to float64 for numerical
-        stability regardless of input dtype. This guarantees the final
-        output honors the project's memory budget on the i7-1360P target.
+        sklearn's internal numerical routines (e.g., StandardScaler)
+        may upcast to float64 for numerical stability regardless of
+        input dtype.
         """
         float64_cols = df.select_dtypes(include=["float64"]).columns
         if len(float64_cols) == 0:
             return df
         if self.config.low_memory_mode:
             logger.warning(
-                "Downcasting %d float64 columns to float32 post-pipeline "
-                "(sklearn internals upcast for numerical stability).",
+                "Downcasting %d float64 columns to float32 "
+                "post-pipeline (sklearn internals upcast for "
+                "numerical stability).",
                 len(float64_cols),
             )
         for col in float64_cols:
@@ -613,28 +673,26 @@ class GenomicsPreprocessor:
         return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Standalone Utility: Label Encoding (deliberately outside the Pipeline)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Standalone Utility: Label Encoding (outside the Pipeline) ──
 
 
 def encode_pam50_labels(y: pd.Series) -> Tuple[np.ndarray, LabelEncoder]:
     """
-    Encode PAM50 string labels into integers for XGBoost/sklearn compatibility.
+    Encode PAM50 string labels into integers for XGBoost/sklearn.
 
-    Deliberately kept OUTSIDE the GenomicsPreprocessor/Pipeline - see the
-    "Why label encoding is NOT part of this class" note in
-    GenomicsPreprocessor's docstring.
+    Deliberately kept OUTSIDE GenomicsPreprocessor -- see that
+    class's "Why label encoding is NOT part of this class" note.
 
     Args:
-        y: PAM50 subtype labels (string or categorical dtype), as produced
-            by TCGADataIngester.run().
+        y: PAM50 subtype labels, as produced by
+            TCGADataIngester.run().
 
     Returns:
         Tuple of (y_encoded, encoder):
             y_encoded: Integer-encoded labels, shape (n_samples,).
-            encoder: Fitted LabelEncoder - keep this to inverse_transform()
-                predictions back to PAM50 subtype names for reporting.
+            encoder: Fitted LabelEncoder -- keep this to
+                inverse_transform() predictions back to subtype
+                names for reporting.
 
     Raises:
         ValueError: If y contains fewer than 2 unique classes.
@@ -652,20 +710,13 @@ def encode_pam50_labels(y: pd.Series) -> Tuple[np.ndarray, LabelEncoder]:
     return y_encoded, encoder
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Standalone Entry Point (for manual testing in PyCharm Run configuration)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Standalone Entry Point ──
 
 if __name__ == "__main__":
     """
     Configure PyCharm Run/Debug:
         Script: src/preprocessing.py
         Working directory: <project root>
-
-    TCGADataIngester, setup_logging, and train_test_split are imported here
-    (not at module level) to keep the importable library surface of this
-    module minimal - a deployment script that only needs GenomicsPreprocessor
-    shouldn't have to drag in the ingestion module's dependencies.
     """
     from sklearn.model_selection import train_test_split
 
@@ -673,41 +724,32 @@ if __name__ == "__main__":
 
     setup_logging("INFO")
 
-    # ── Stage 1: Ingest raw data (previous pipeline stage) ──────────────
     ingester = TCGADataIngester(data_dir="data/raw/")
     X, y, ingestion_meta = ingester.run()
 
-    # ── Stage 2: Split BEFORE any preprocessing statistic is learned ────
-    # Note: although preprocessing appears as Step 3 in the original
-    # roadmap (before the Step 5 train/test split), every fit-time
-    # statistic (expression mask, variance mask, scaler mean/std) must
-    # only ever see training data. We split first here, then fit
-    # preprocessing exclusively on X_train.
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=42
     )
 
-    # ── Stage 3: Preprocess (fit on train, transform both) ──────────────
     preprocessor = GenomicsPreprocessor()
     X_train_processed = preprocessor.fit_transform(X_train)
     X_test_processed = preprocessor.transform(X_test)
 
-    # ── Stage 4: Encode labels (kept separate - see docstring) ──────────
     y_train_encoded, label_encoder = encode_pam50_labels(y_train)
+    joblib.dump(label_encoder, "models/label_encoder.joblib")
     y_test_encoded = label_encoder.transform(y_test)
 
-    # ── Summary ───────────────────────────────────────────────────────
     sep = "=" * 60
     print(f"\n{sep}")
     print("  PREPROCESSING COMPLETE - SUMMARY")
     print(sep)
     print(f"  X_train_processed : {X_train_processed.shape}")
     print(f"  X_test_processed  : {X_test_processed.shape}")
-    print(f"  Genes retained    : {len(preprocessor.get_selected_genes())}")
+    n_genes = len(preprocessor.get_selected_genes())
+    print(f"  Genes retained    : {n_genes}")
     print(f"  Classes           : {list(label_encoder.classes_)}")
     print(sep)
 
-    # ── Persist for the modeling stage / FastAPI deployment ─────────────
     preprocessor.save("models/preprocessing_pipeline.joblib")
     print("  Pipeline saved to models/preprocessing_pipeline.joblib")
     print("  X_train_processed, X_test_processed ready for src/models/")

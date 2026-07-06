@@ -1,38 +1,61 @@
 """
 data_ingestion.py
 =================
-Production-ready, memory-optimized ingestion module for TCGA-BRCA RNA-Seq data.
+Memory-optimized ETL pipeline for TCGA-BRCA RNA-Seq data, refactored
+for a phenotype-source pivot: expression still comes from the GDC
+hub, but subtype labels now come from the UCSC Xena Toil Recompute
+pan-cancer phenotype file (TcgaTargetGTEX_phenotype.txt.gz).
 
-Handles the full ETL workflow from raw UCSC Xena TSV files to an aligned
-(X, y) pair ready for preprocessing. Engineered specifically for machines
-with limited RAM (≤16GB) and no discrete GPU (e.g., Intel i7-1360P).
+HISTORICAL BUG FIXED -- FLOAT CASTING AT READ TIME
+----------------------------------------------------
+Passing dtype=np.float32 directly into pd.read_csv() together with
+index_col=0 previously raised:
+    ValueError: could not convert string to float: 'ENSG...'
+A scalar dtype can be applied across all parsed columns before
+index_col fully detaches the gene-ID column from the numeric data
+block, so the parser attempts to cast gene IDs to float and fails.
+Fix: let pandas infer dtypes naturally at read time (gene IDs become
+the object index, sample columns become float64), THEN downcast the
+fully-formed DataFrame with a single .astype(self.config.float_dtype)
+call, applied only after index_col has already separated the index.
+See _load_expression_matrix().
 
-Memory Budget for TCGA-BRCA:
-    Raw float64 matrix (1,100 × 60,000) : ~528 MB  ← AVOIDED
-    With float32 at load time            : ~264 MB  ← TARGET
-    Peak during transpose + alignment    : ~600 MB  ← MANAGED via gc.collect()
-    Final aligned X in memory            : ~264 MB
+DATASET PIVOT -- TOIL RECOMPUTE PHENOTYPE FILE
+--------------------------------------------------
+Phenotype labels now come from TcgaTargetGTEX_phenotype.txt.gz. Two
+consequences of this pivot are handled explicitly:
 
-Optimization Techniques Used:
-    1. dtype=np.float32 specified at pd.read_csv() — no post-load copy needed
-    2. Two-pass reading: header inspection before full allocation
-    3. usecols in phenotype load — skips ~100 irrelevant clinical columns
-    4. dtype='category' for string label column (10-100x memory saving)
-    5. Explicit del + gc.collect() after each major allocation is freed
-    6. Column-level downcast pass (float64 → float32) as a safety net
-    7. MemoryReporter instruments every stage for regression detection
+  1. COHORT CONTAMINATION -- this file mixes TCGA, GTEx, and TARGET
+     samples in one table. _load_phenotype_labels() strict-filters
+     the phenotype index to barcodes starting with
+     config.cohort_prefix ('TCGA' by default) immediately after
+     loading, before any other processing happens.
+
+  2. LABEL NAMING VARIANCE -- this file does not use the fixed
+     column name 'paper_BRCA_Subtype_PAM50' from the old GDC file.
+     _detect_label_column() searches column names case-
+     insensitively for config.label_column_hints ('pam50',
+     'subtype') and raises an explicit KeyError if none match.
+     IMPORTANT: the standard Toil phenotype file typically only
+     carries cohort-level metadata (sample type, primary site,
+     study) -- it does not carry molecular subtype calls. If your
+     copy has no matching column, that error is expected, not a
+     bug -- see the message this file was delivered with.
+
+BARCODE ALIGNMENT -- GDC EXPRESSION x TOIL PHENOTYPE
+---------------------------------------------------------
+The two files are different Xena hubs and do not share identical
+barcode granularity. _align_samples() truncates both indices to
+config.barcode_length characters (15 by default), drops any row
+whose barcode collides with another after truncation (ambiguous --
+we cannot know which row is "correct"), then strictly intersects the
+two remaining indices before subsetting X and y.
 
 Usage:
-    >>> from src.data_ingestion import TCGADataIngester, IngestionConfig
-    >>> config = IngestionConfig(low_memory_mode=True)
-    >>> ingester = TCGADataIngester(data_dir="data/raw/", config=config)
+    >>> from src.data_ingestion import TCGADataIngester
+    >>> ingester = TCGADataIngester(data_dir="data/raw/")
     >>> X, y, metadata = ingester.run()
-    >>> print(f"Ready: X={X.shape}, classes={y.unique().tolist()}")
-
-Data Source:
-    UCSC Xena Browser → GDC Hub → TCGA-BRCA cohort
-    Expression : https://xenabrowser.net → TCGA-BRCA.htseq_fpkm-uq.tsv.gz
-    Phenotype  : https://xenabrowser.net → TCGA-BRCA.GDC_phenotype.tsv.gz
+    >>> print(metadata["label_column_used"])
 
 Author: [Your Name]
 Date  : [Project Date]
@@ -42,73 +65,82 @@ import gc
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Module-level logger — configured by the caller (see setup_logging() below)
-# ──────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration Dataclass
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Configuration Dataclass ──
 
 
 @dataclass
 class IngestionConfig:
     """
-    Immutable configuration for the TCGA ingestion pipeline.
-
-    Using a dataclass (rather than kwargs or a dict) enforces type safety,
-    enables IDE autocomplete, and makes it trivially mockable in unit tests
-    by substituting a config pointing to a synthetic mini-dataset.
+    Immutable configuration for the TCGA/Toil ingestion pipeline.
 
     Attributes:
-        expression_filename: Filename of the gzipped RNA-Seq TSV from UCSC Xena.
-        phenotype_filename:  Filename of the gzipped phenotype TSV from UCSC Xena.
-        label_column:        Column name in phenotype file containing PAM50 labels.
-        valid_subtypes:      Tuple of canonical PAM50 class strings to retain.
-            TCGA uses abbreviated names in the phenotype file:
-            'LumA', 'LumB', 'Her2', 'Basal', 'Normal'
-        low_memory_mode:     If True, adds extra gc.collect() calls and logs
-            memory at every stage. Recommended for ≤16GB systems.
-        float_dtype:         NumPy dtype for expression values. float32 is
-            sufficient for log-normalized FPKM (range ~0–30) and halves RAM.
-        barcode_length:      TCGA sample barcode length to use for alignment.
-            UCSC Xena uses 16-char barcodes; phenotype uses 15-char.
-            Set to min(len) of your actual barcodes if alignment fails.
+        expression_filename : GDC-hub RNA-Seq matrix filename.
+            Unchanged by this pivot -- expression still comes from
+            the GDC hub; only the phenotype source changed.
+        phenotype_filename  : Toil Recompute pan-cancer phenotype
+            filename. Mixes TCGA, GTEx, and TARGET samples in one
+            table -- see cohort_prefix below.
+        label_column        : Optional exact column-name override.
+            If set AND present in the phenotype header, used
+            directly instead of running hint-based detection.
+        label_column_hints  : Case-insensitive substrings used by
+            _detect_label_column() when label_column is not set.
+            NOTE: the standard Toil phenotype file typically only
+            carries cohort-level metadata, not molecular subtype
+            calls -- see the module docstring.
+        cohort_prefix       : Barcode prefix kept when filtering the
+            phenotype index immediately after loading. Removes
+            cross-cohort contamination (GTEx, TARGET samples
+            bundled into the same Toil file). Default 'TCGA'.
+        low_memory_mode     : Extra gc.collect() calls and memory
+            logging at each stage.
+        float_dtype         : Target dtype for expression values.
+        barcode_length      : Character count both indices are
+            truncated to before alignment (see _align_samples()).
+            GDC and Toil hubs do not always share identical barcode
+            granularity; 15 chars ('TCGA-XX-XXXX-XX') is the common
+            sample-level prefix both sources share.
     """
 
     expression_filename: str = "TCGA-BRCA.htseq_fpkm-uq.tsv.gz"
     phenotype_filename: str = "TCGA-BRCA.GDC_phenotype.tsv.gz"
-    label_column: str = "paper_BRCA_Subtype_PAM50"
-    valid_subtypes: Tuple[str, ...] = ("LumA", "LumB", "Her2", "Basal", "Normal")
+    label_column: Optional[str] = None
+    label_column_hints: Tuple[str, ...] = ("vital_status",)
+    cohort_prefix: str = "TCGA"
     low_memory_mode: bool = True
     float_dtype: type = np.float32
-    barcode_length: int = 15  # Trim both sources to this length for alignment
+    barcode_length: int = 15
+
+    def __post_init__(self) -> None:
+        if not self.label_column_hints:
+            raise ValueError("label_column_hints must contain at least one hint.")
+        if not self.cohort_prefix:
+            raise ValueError("cohort_prefix must be a non-empty string.")
+        if self.barcode_length <= 0:
+            raise ValueError(
+                "barcode_length must be positive; got " f"{self.barcode_length}."
+            )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Memory Reporter Utility
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Memory Reporter Utility ──
 
 
 class MemoryReporter:
     """
-    Utility class to instrument DataFrame memory consumption at each pipeline stage.
+    Instruments DataFrame memory consumption at each pipeline stage.
 
-    Provides consistent, structured logging of shape and memory so memory
-    regressions (e.g., an accidental float64 column introduced upstream)
-    are immediately visible in logs without manual debugging.
-
-    Example output:
-        [MemoryReport] Raw Expression Matrix | Shape: (60483, 1113) | Memory: 511.4 MB
-        [MemoryReport] Transposed Matrix     | Shape: (1113, 60483) | Memory: 511.4 MB
-        [MemoryReport] Final Aligned X       | Shape: (1084, 60483) | Memory: 248.7 MB
+    Provides consistent, structured logging of shape and memory so
+    memory regressions (e.g., an accidental float64 column
+    introduced upstream) are immediately visible in logs without
+    manual debugging.
     """
 
     @staticmethod
@@ -118,16 +150,17 @@ class MemoryReporter:
 
         Args:
             df:    The DataFrame to profile.
-            label: Human-readable name for log output (e.g., 'Raw Expression Matrix').
+            label: Human-readable name for log output, e.g.
+                'Raw Expression Matrix'.
 
         Returns:
-            Dict with keys: 'total_mb' (float), 'shape' (tuple), 'n_cells' (int),
-            'dtype_counts' (dict mapping dtype string → column count).
+            Dict with keys: 'total_mb' (float), 'shape' (tuple),
+            'n_cells' (int), 'dtype_counts' (dict mapping dtype
+            string to column count).
         """
         mem_bytes = df.memory_usage(deep=True).sum()
         mem_mb = round(mem_bytes / (1024**2), 2)
 
-        # Count columns by dtype for fast dtype-regression detection
         dtype_counts: Dict[str, int] = (
             df.dtypes.value_counts().rename(index=str).to_dict()
         )
@@ -140,7 +173,7 @@ class MemoryReporter:
         }
 
         logger.info(
-            "[MemoryReport] %-40s | Shape: %-18s | Memory: %7.1f MB | Dtypes: %s",
+            "[MemoryReport] %-40s | Shape: %-18s | Memory: " "%7.1f MB | Dtypes: %s",
             label,
             str(df.shape),
             mem_mb,
@@ -149,37 +182,50 @@ class MemoryReporter:
         return stats
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main Ingestion Class
-# ──────────────────────────────────────────────────────────────────────────────
+# Candidate exact-match names for the sample-barcode column, tried
+# in order before falling back to a substring heuristic. GDC-hub
+# files typically use 'submitter_id.samples'; Toil-hub files
+# typically use 'sample'.
+_BARCODE_COLUMN_CANDIDATES: Tuple[str, ...] = (
+    "sample",
+    "submitter_id.samples",
+    "sampleid",
+    "barcode",
+)
+
+
+# ── Main Ingestion Class ──
 
 
 class TCGADataIngester:
     """
-    Memory-efficient ETL pipeline for TCGA-BRCA RNA-Seq expression data.
+    Memory-efficient ETL pipeline for TCGA-BRCA RNA-Seq expression
+    data, with phenotype labels sourced from a separate Xena hub.
 
-    Orchestrates loading, validation, transposition, label alignment, and
-    memory optimization of UCSC Xena formatted files into an (X, y) pair
-    ready for the preprocessing module.
+    Orchestrates loading, validation, transposition, label
+    detection, cohort filtering, barcode alignment, and memory
+    optimization into an (X, y) pair ready for preprocessing.
 
     Design Principles:
-        - Separation of concerns: each private method does exactly one ETL step.
-        - All configuration is injected via IngestionConfig (no hardcoded paths).
+        - Separation of concerns: each private method does exactly
+          one ETL step.
+        - All configuration is injected via IngestionConfig.
         - Memory is profiled at every stage via MemoryReporter.
-        - Errors are specific and actionable — they tell the user exactly what
-          file is missing and where to download it.
+        - Errors are specific and actionable.
 
     Attributes:
-        data_dir (Path): Resolved absolute path to the raw data directory.
-        config (IngestionConfig): Ingestion configuration and parameters.
+        data_dir (Path): Resolved absolute path to the raw data dir.
+        config (IngestionConfig): Ingestion configuration.
         reporter (MemoryReporter): Memory instrumentation utility.
 
     Raises:
         FileNotFoundError: If data_dir or required files are absent.
-        ValueError: If the loaded data is empty, malformed, or yields
+        KeyError: If the barcode or label column cannot be found or
+            auto-detected in the phenotype file.
+        ValueError: If loaded data is empty, malformed, or yields
             fewer than 100 aligned samples.
-        MemoryError: If the expression matrix cannot be loaded in available RAM
-            (hint: enable low_memory_mode or increase system swap).
+        MemoryError: If the expression matrix cannot be loaded in
+            available RAM.
     """
 
     def __init__(
@@ -188,88 +234,74 @@ class TCGADataIngester:
         config: Optional[IngestionConfig] = None,
     ) -> None:
         """
-        Initialize the ingester with the data directory path and optional config.
+        Initialize the ingester with the data directory and config.
 
         Args:
-            data_dir: Path (relative or absolute) to the folder containing
-                TCGA-BRCA raw files. Will be resolved to an absolute Path.
-            config:   IngestionConfig instance. If None, uses class defaults.
+            data_dir: Path to the folder containing raw files.
+                Resolved to an absolute Path.
+            config:   IngestionConfig instance. Uses defaults if
+                None.
 
         Raises:
             FileNotFoundError: If data_dir does not exist on disk.
-
-        Example:
-            >>> ingester = TCGADataIngester(data_dir="data/raw/")
-            >>> ingester = TCGADataIngester(
-            ...     data_dir="data/raw/",
-            ...     config=IngestionConfig(low_memory_mode=True, barcode_length=15)
-            ... )
         """
         self.data_dir = Path(data_dir).resolve()
 
         if not self.data_dir.exists():
             raise FileNotFoundError(
                 f"Data directory not found: {self.data_dir}\n"
-                f"Create it with: mkdir -p {self.data_dir}\n"
-                f"Then download TCGA-BRCA files from: https://xenabrowser.net"
+                f"Create it with: mkdir -p {self.data_dir}"
             )
 
         self.config = config or IngestionConfig()
         self.reporter = MemoryReporter()
 
         logger.info(
-            "TCGADataIngester initialized | data_dir=%s | low_memory=%s | dtype=%s",
+            "TCGADataIngester initialized | data_dir=%s | "
+            "low_memory=%s | dtype=%s | cohort_prefix=%s",
             self.data_dir,
             self.config.low_memory_mode,
             self.config.float_dtype.__name__,
+            self.config.cohort_prefix,
         )
 
-    # ── Private Methods ───────────────────────────────────────────────────────
+    # ── Private Methods ──
 
     def _load_expression_matrix(self) -> pd.DataFrame:
         """
-        Load the UCSC Xena RNA-Seq expression matrix into memory as float32.
+        Load the GDC-hub RNA-Seq expression matrix and downcast to
+        float32 AFTER the gene-ID index column is separated out.
 
-        UCSC Xena format:
-            - Rows    → genes (Ensembl IDs or HUGO symbols)
-            - Columns → TCGA sample barcodes
-            - Values  → FPKM-UQ normalized expression (non-negative floats)
-
-        After loading, the matrix is transposed to (samples × genes) to match
-        the scikit-learn convention of (n_observations, n_features).
+        See the module docstring for the historical ValueError this
+        ordering fixes.
 
         Memory Strategy:
-            Pass 1 (2 rows)   : Inspect file structure and sample count → no cost
-            Pass 2 (full load): dtype=float32 specified upfront → ~264MB peak
-            Transpose         : Creates a new object → peaks at ~528MB briefly
-            del original      : Drops to ~264MB
-            gc.collect()      : Forces CPython to reclaim the freed ~264MB
+            Pass 1 (2 rows)    : Inspect file structure -> no cost.
+            Pass 2 (full load) : dtypes inferred naturally, then
+                                  downcast in one .astype() call.
+            Transpose          : New object; briefly holds both.
+            del original       : Frees the pre-transpose copy.
+            gc.collect()       : Reclaims freed memory immediately.
 
         Returns:
-            pd.DataFrame of shape (n_samples, n_genes) with float32 values.
-            Row index: TCGA sample barcodes (str, trimmed to barcode_length).
-            Column names: gene identifiers (Ensembl IDs or HUGO symbols).
+            pd.DataFrame, shape (n_samples, n_genes), float32,
+            indexed by TCGA sample barcode, columns are gene IDs.
 
         Raises:
-            FileNotFoundError: If the expression file is not in data_dir.
+            FileNotFoundError: If the expression file is missing.
             ValueError: If the file loads as an empty DataFrame.
-            MemoryError: If RAM is insufficient even for float32 loading.
+            MemoryError: If RAM is insufficient to load the matrix.
         """
         expr_path = self.data_dir / self.config.expression_filename
 
         if not expr_path.exists():
             raise FileNotFoundError(
                 f"Expression file not found: {expr_path}\n"
-                f"\nDownload steps:\n"
-                f"  1. Go to: https://xenabrowser.net/datapages/\n"
-                f"  2. Select: GDC TCGA Breast Cancer (BRCA) → Gene Expression RNAseq\n"
-                f"  3. Download: TCGA-BRCA.htseq_fpkm-uq.tsv.gz\n"
-                f"  4. Place in: {self.data_dir}"
+                "Download 'TCGA-BRCA.htseq_fpkm-uq.tsv.gz' from "
+                "the GDC hub at https://xenabrowser.net/datapages/ "
+                f"and place it in: {self.data_dir}"
             )
 
-        # ── Pass 1: Header Inspection ─────────────────────────────────────────
-        # Read only 2 rows to detect file structure cheaply before committing
-        # to a full load. This catches malformed files early.
         logger.info("Pass 1: Inspecting expression matrix header...")
         try:
             header_peek = pd.read_csv(
@@ -281,57 +313,55 @@ class TCGADataIngester:
             )
         except Exception as exc:
             raise ValueError(
-                f"Cannot read expression file header. File may be corrupt: {exc}"
+                "Cannot read expression file header. File may be " f"corrupt: {exc}"
             ) from exc
 
         n_samples_detected = len(header_peek.columns)
-
         logger.info(
-            "Header inspection complete | Detected samples: %d | "
-            "Proceeding with full float32 load...",
+            "Header inspection complete | Detected samples: %d",
             n_samples_detected,
         )
         del header_peek
         gc.collect()
 
-        # ── Pass 2: Full Load with float32 ───────────────────────────────────
-        # dtype=np.float32 is applied at the C-level CSV parser — this means
-        # Python never allocates float64 memory. The savings compound because
-        # the 60,000-column shape makes this a large allocation.
-        logger.info("Pass 2: Loading full expression matrix as float32...")
+        logger.info("Pass 2: Loading full expression matrix...")
         try:
             expr_df = pd.read_csv(
                 expr_path,
                 sep="\t",
                 compression="gzip",
-                index_col=0,  # Gene identifiers become row index
-                dtype=self.config.float_dtype,  # ← Core memory optimization
-                low_memory=False,  # Prevents ambiguous mixed-type inference
+                index_col=0,  # Gene IDs -> index FIRST
+                low_memory=False,  # Avoid ambiguous mixed-type read
             )
         except MemoryError as exc:
             raise MemoryError(
-                "Insufficient RAM to load the expression matrix even as float32.\n"
+                "Insufficient RAM to load the expression matrix.\n"
                 "Options:\n"
                 "  1. Close other applications to free RAM.\n"
                 "  2. Increase system swap/page file size.\n"
-                "  3. Pre-filter genes to top 20K variance-ranked before loading.\n"
+                "  3. Pre-filter genes to a top-variance subset "
+                "before loading.\n"
                 f"Original error: {exc}"
             ) from exc
 
         if expr_df.empty:
             raise ValueError(
-                f"Expression matrix loaded as empty. "
-                f"Check file integrity: {expr_path}"
+                "Expression matrix loaded as empty. Check file "
+                f"integrity: {expr_path}"
             )
 
-        self.reporter.report(expr_df, "Raw Expression Matrix (genes × samples)")
+        self.reporter.report(expr_df, "Raw Expression Matrix (float64)")
 
-        # ── Transpose: genes × samples → samples × genes ─────────────────────
-        # .T creates a new DataFrame object. During this call, both the original
-        # and its transpose exist simultaneously → brief peak at ~2× matrix size.
-        # We immediately delete the original to reclaim memory.
+        # Downcast AFTER index_col=0 has already separated the
+        # gene-ID column from the numeric sample columns -- this is
+        # the fix for the historical ValueError described above.
+        expr_df = expr_df.astype(self.config.float_dtype)
+        if self.config.low_memory_mode:
+            gc.collect()
+        self.reporter.report(expr_df, "Expression Matrix (float32)")
+
         logger.info(
-            "Transposing matrix: (%d genes × %d samples) → (%d samples × %d genes)...",
+            "Transposing: (%d genes x %d samples) -> " "(%d samples x %d genes)...",
             expr_df.shape[0],
             expr_df.shape[1],
             expr_df.shape[1],
@@ -339,95 +369,212 @@ class TCGADataIngester:
         )
         expr_transposed = expr_df.T
 
-        # Free the un-transposed copy immediately
         del expr_df
         if self.config.low_memory_mode:
-            gc.collect()  # Force CPython to release the memory now, not lazily
+            gc.collect()
 
-        self.reporter.report(expr_transposed, "Transposed Matrix (samples × genes)")
-
+        self.reporter.report(expr_transposed, "Transposed Matrix (samples x genes)")
         return expr_transposed
+
+    @staticmethod
+    def _detect_barcode_column(columns: List[str]) -> str:
+        """
+        Identify the sample-barcode column across different hubs.
+
+        Tries exact, case-insensitive matches against
+        _BARCODE_COLUMN_CANDIDATES first, then falls back to any
+        column containing 'sample' as a substring.
+
+        Args:
+            columns: All column names from the phenotype file.
+
+        Returns:
+            The detected barcode column name (original casing).
+
+        Raises:
+            KeyError: If no candidate or fallback match is found.
+        """
+        lowered = {c.lower(): c for c in columns}
+
+        for candidate in _BARCODE_COLUMN_CANDIDATES:
+            if candidate in lowered:
+                return lowered[candidate]
+
+        fallback = [c for c in columns if "sample" in c.lower()]
+        if fallback:
+            return fallback[0]
+
+        raise KeyError(
+            "Cannot find a sample-barcode column in the phenotype "
+            f"file. Available columns: {columns[:15]} "
+            f"(total {len(columns)})."
+        )
+
+    @staticmethod
+    def _detect_label_column(
+        columns: List[str],
+        hints: Tuple[str, ...],
+        exclude: str,
+    ) -> str:
+        """
+        Auto-detect the subtype/label column via case-insensitive
+        substring matching on column names.
+
+        Args:
+            columns: All column names from the phenotype file.
+            hints:   Substrings to match, case-insensitively.
+            exclude: Column name to exclude from candidates (the
+                barcode column).
+
+        Returns:
+            The detected label column name (original casing).
+
+        Raises:
+            KeyError: If zero columns match. This is the expected
+                outcome when the loaded phenotype file carries only
+                cohort-level metadata (sample type, primary site,
+                study) rather than disease-specific molecular
+                subtype calls -- see the module docstring.
+        """
+        candidates = [c for c in columns if c != exclude]
+        matches = [c for c in candidates if any(hint in c.lower() for hint in hints)]
+
+        if not matches:
+            raise KeyError(
+                f"No column matched hints {hints} (case-"
+                f"insensitive) among {len(candidates)} candidate "
+                f"columns: {candidates[:15]}. This commonly "
+                "happens when the loaded phenotype file only "
+                "carries cohort-level metadata (sample type, "
+                "primary site, study) rather than disease-specific "
+                "molecular subtype calls. Verify the file actually "
+                "contains a subtype column, or set "
+                "IngestionConfig.label_column explicitly."
+            )
+
+        if len(matches) > 1:
+            logger.warning(
+                "Multiple columns matched label hints %s: %s. "
+                "Using '%s'. Set IngestionConfig.label_column "
+                "explicitly to choose a different one.",
+                hints,
+                matches,
+                matches[0],
+            )
+
+        return matches[0]
 
     def _load_phenotype_labels(self) -> pd.DataFrame:
         """
-        Load PAM50 subtype labels from the TCGA clinical phenotype file.
+        Load subtype labels from the Toil Recompute phenotype file.
 
-        Uses usecols to load only the 2 columns we need (sample barcode + label)
-        out of the ~100+ clinical metadata columns in the full phenotype file.
-        This avoids loading irrelevant columns into memory.
+        Detects the barcode and label columns dynamically, loads
+        only those two columns, then immediately strict-filters the
+        resulting index to barcodes starting with
+        config.cohort_prefix -- removing GTEx/TARGET contamination
+        before any further processing.
 
         Returns:
-            pd.DataFrame indexed by TCGA sample barcode, with one column:
-            the PAM50 label column as a CategoricalDtype Series.
+            pd.DataFrame indexed by TCGA sample barcode (TCGA-only),
+            with one column: the detected label, as category dtype.
 
         Raises:
-            FileNotFoundError: If the phenotype file is not in data_dir.
-            KeyError: If the PAM50 label column name doesn't exist in the file.
-                      This usually means the column was renamed in a newer release.
+            FileNotFoundError: If the phenotype file is missing.
+            KeyError: If the barcode or label column cannot be
+                found. See _detect_label_column()'s docstring for
+                why this is the expected outcome with the standard
+                Toil phenotype file.
+            ValueError: If no rows remain after cohort filtering.
         """
         pheno_path = self.data_dir / self.config.phenotype_filename
 
         if not pheno_path.exists():
             raise FileNotFoundError(
                 f"Phenotype file not found: {pheno_path}\n"
-                f"\nDownload steps:\n"
-                f"  1. Go to: https://xenabrowser.net/datapages/\n"
-                f"  2. Select: GDC TCGA Breast Cancer (BRCA) → Phenotype\n"
-                f"  3. Download: TCGA-BRCA.GDC_phenotype.tsv.gz\n"
-                f"  4. Place in: {self.data_dir}"
+                "Download 'TcgaTargetGTEX_phenotype.txt.gz' from "
+                "the UCSC Xena Toil Recompute hub "
+                "('TCGA TARGET GTEx' cohort -> Phenotype) at "
+                "https://xenabrowser.net/datapages/ and place it "
+                f"in: {self.data_dir}"
             )
 
-        logger.info("Loading phenotype file (PAM50 labels only)...")
-
-        # Probe column names before filtering to give a helpful error if the
-        # label column doesn't exist in this version of the phenotype file.
+        logger.info("Inspecting phenotype header for columns...")
         try:
-            pheno_columns = pd.read_csv(
+            header_columns = pd.read_csv(
                 pheno_path,
                 sep="\t",
                 compression="gzip",
-                nrows=0,  # Zero rows — just headers
+                nrows=0,
             ).columns.tolist()
         except Exception as exc:
             raise ValueError(f"Cannot read phenotype file header: {exc}") from exc
 
-        barcode_col = "submitter_id.samples"
-        if barcode_col not in pheno_columns:
-            # Try alternate barcode column names used in older Xena releases
-            barcode_col = next(
-                (c for c in pheno_columns if "submitter" in c.lower()),
-                None,
-            )
-            if barcode_col is None:
-                raise KeyError(
-                    f"Cannot find sample barcode column in phenotype file.\n"
-                    f"Available columns: {pheno_columns[:10]} ... "
-                    f"(total {len(pheno_columns)})"
-                )
+        barcode_col = self._detect_barcode_column(header_columns)
 
-        if self.config.label_column not in pheno_columns:
-            raise KeyError(
-                f"PAM50 label column '{self.config.label_column}' not found.\n"
-                f"Available columns: {pheno_columns}\n"
-                f"Update IngestionConfig.label_column to match the correct name."
+        if self.config.label_column and self.config.label_column in header_columns:
+            label_col = self.config.label_column
+            logger.info(
+                "Using configured label column override: '%s'",
+                label_col,
+            )
+        else:
+            label_col = self._detect_label_column(
+                header_columns,
+                self.config.label_column_hints,
+                exclude=barcode_col,
+            )
+            logger.info(
+                "Auto-detected label column via hints %s: '%s'",
+                self.config.label_column_hints,
+                label_col,
             )
 
-        # Load only the 2 needed columns
+        logger.info(
+            "Loading phenotype columns ['%s', '%s'] only...",
+            barcode_col,
+            label_col,
+        )
         pheno_df = pd.read_csv(
             pheno_path,
             sep="\t",
             compression="gzip",
-            usecols=[barcode_col, self.config.label_column],  # ← Selective load
-            dtype={self.config.label_column: "category"},  # ← Categorical dtype
+            usecols=[barcode_col, label_col],
+            dtype={label_col: "category"},
+            low_memory=False,
         )
 
-        # Set barcode as index, strip trailing whitespace from barcodes
-        pheno_df[barcode_col] = pheno_df[barcode_col].str.strip()
+        pheno_df[barcode_col] = pheno_df[barcode_col].astype(str).str.strip()
         pheno_df = pheno_df.set_index(barcode_col)
 
-        label_dist = pheno_df[self.config.label_column].value_counts()
+        # ── Strict cohort filter, immediately after loading ──
+        # Removes GTEx/TARGET contamination before anything else
+        # touches this DataFrame.
+        n_before_filter = len(pheno_df)
+        cohort_mask = pheno_df.index.str.startswith(self.config.cohort_prefix)
+        pheno_df = pheno_df.loc[cohort_mask]
+        n_dropped_cohort = n_before_filter - len(pheno_df)
+
         logger.info(
-            "Phenotype loaded | Shape: %s | PAM50 distribution:\n%s",
+            "Cohort filter '%s*' | Kept %d / %d rows (dropped %d "
+            "non-%s rows, e.g. GTEx/TARGET).",
+            self.config.cohort_prefix,
+            len(pheno_df),
+            n_before_filter,
+            n_dropped_cohort,
+            self.config.cohort_prefix,
+        )
+
+        if pheno_df.empty:
+            raise ValueError(
+                "No rows remain after filtering for barcodes "
+                f"starting with '{self.config.cohort_prefix}'. "
+                f"Verify column '{barcode_col}' stores TCGA-format "
+                "sample IDs."
+            )
+
+        label_dist = pheno_df[label_col].value_counts(dropna=False)
+        logger.info(
+            "Phenotype loaded | Shape: %s | Label distribution:\n%s",
             pheno_df.shape,
             label_dist.to_string(),
         )
@@ -440,148 +587,163 @@ class TCGADataIngester:
         pheno_df: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, pd.Series]:
         """
-        Align expression matrix and phenotype labels on TCGA sample barcodes.
+        Align expression and phenotype data via strict index
+        intersection, truncating both barcodes to a common length
+        first since GDC and Toil hubs do not share identical
+        barcode granularity.
 
-        Alignment Strategy:
-            TCGA barcodes appear in different lengths across UCSC Xena files.
-            We trim both indices to config.barcode_length characters before
-            joining. The default is 15 characters:
-            'TCGA-3C-AAAU-01A-11R-A41B-07' → 'TCGA-3C-AAAU-01A'
-            This drops the vial/portion/analyte suffix which is not meaningful
-            for sample-level label alignment.
+        Steps:
+            1. Truncate both indices to config.barcode_length chars.
+            2. Drop any barcode that collides with another AFTER
+               truncation, independently in each source -- such
+               collisions are ambiguous and cannot be resolved.
+            3. common_index = expr_df.index.intersection(y.index)
+            4. Subset both X and y to common_index.
+            5. Drop any sample whose label is NaN.
 
         Args:
-            expr_df:  Transposed expression matrix (samples × genes).
-            pheno_df: Phenotype DataFrame indexed by TCGA barcode.
+            expr_df:  Transposed expression matrix (samples x
+                genes), full-length barcodes.
+            pheno_df: Phenotype DataFrame indexed by TCGA barcode,
+                already cohort-filtered, one label column.
 
         Returns:
-            Tuple (X, y) where:
-                X: pd.DataFrame, shape (n_aligned_samples, n_genes), float32.
-                y: pd.Series, dtype='category', PAM50 labels.
+            Tuple (X, y):
+                X: float32 DataFrame, shape (n_aligned, n_genes).
+                y: category Series, detected subtype labels.
 
         Raises:
-            ValueError: If fewer than 100 samples remain after alignment.
-                        Usually indicates a barcode format mismatch.
+            ValueError: If fewer than 100 samples remain after
+                intersection, or fewer than 2 distinct label values
+                remain after NaN removal.
         """
-        logger.info(
-            "Aligning barcodes (trimming to %d chars)...",
-            self.config.barcode_length,
-        )
-
-        # Trim barcodes to ensure consistent length across both sources
         k = self.config.barcode_length
+        logger.info("Truncating both indexes to %d chars...", k)
+
         expr_df.index = expr_df.index.str[:k]
         pheno_df.index = pheno_df.index.str[:k]
 
-        n_expr_before = len(expr_df)
+        # Truncation can collapse two distinct full-length barcodes
+        # (e.g. two aliquots/portions of the same tumor) onto the
+        # same k-char prefix. Such collisions are ambiguous -- we
+        # cannot know which row is "correct" -- so every colliding
+        # row is dropped from its own source BEFORE the two sources
+        # are intersected.
+        expr_dupes = expr_df.index.duplicated(keep=False)
+        if expr_dupes.any():
+            n_dupes = int(expr_dupes.sum())
+            logger.warning(
+                "Dropping %d expression row(s) with duplicate " "truncated barcodes.",
+                n_dupes,
+            )
+            expr_df = expr_df.loc[~expr_dupes]
 
-        # Inner join: only keep samples present in BOTH files
-        aligned_df = expr_df.join(pheno_df, how="inner")
+        pheno_dupes = pheno_df.index.duplicated(keep=False)
+        if pheno_dupes.any():
+            n_dupes = int(pheno_dupes.sum())
+            logger.warning(
+                "Dropping %d phenotype row(s) with duplicate " "truncated barcodes.",
+                n_dupes,
+            )
+            pheno_df = pheno_df.loc[~pheno_dupes]
 
-        n_after_join = len(aligned_df)
+        label_col = pheno_df.columns[0]
+        y_full = pheno_df[label_col]
+
+        # Strict index intersection -- the single alignment
+        # authority for this method. Only barcodes present in both
+        # de-duplicated sources survive.
+        common_index = expr_df.index.intersection(y_full.index)
+
         logger.info(
-            "Inner join result: %d expression samples → %d aligned with phenotype",
-            n_expr_before,
-            n_after_join,
+            "Index intersection | Expression: %d | Phenotype: %d " "| Common: %d",
+            len(expr_df.index),
+            len(y_full.index),
+            len(common_index),
         )
 
-        if n_after_join < 100:
-            logger.warning(
-                "Only %d samples aligned. This is likely a barcode mismatch.\n"
-                "Try setting config.barcode_length to a different value (15 or 16).\n"
-                "Inspect barcodes with:\n"
-                "  print(expr_df.index[:5].tolist())\n"
-                "  print(pheno_df.index[:5].tolist())",
-                n_after_join,
-            )
+        if len(common_index) < 100:
             raise ValueError(
-                f"Alignment produced only {n_after_join} samples (minimum: 100). "
-                f"Check barcode format compatibility between your two files."
+                f"Only {len(common_index)} samples survived index "
+                "intersection (minimum: 100). This usually means "
+                "the two files use incompatible barcode formats -- "
+                "inspect expr_df.index[:5] and pheno_df.index[:5] "
+                "directly, and adjust IngestionConfig.barcode_"
+                "length if needed."
             )
 
-        # Filter to valid PAM50 subtypes — removes NaN labels and any
-        # non-canonical category strings (e.g., 'NA', 'Unknown')
-        valid_mask = aligned_df[self.config.label_column].isin(
-            self.config.valid_subtypes
-        )
-        n_dropped = (~valid_mask).sum()
+        X = expr_df.loc[common_index]
+        y = y_full.loc[common_index]
 
-        if n_dropped > 0:
+        # Drop any sample whose label is NaN -- required even
+        # after intersection, since a barcode can exist in both
+        # files while its label value itself is missing.
+        valid_mask = y.notna()
+        n_nan = int((~valid_mask).sum())
+        if n_nan > 0:
             logger.warning(
-                "Dropped %d samples with invalid/missing PAM50 labels "
-                "(NaN or not in %s).",
-                n_dropped,
-                self.config.valid_subtypes,
+                "Dropping %d sample(s) with a NaN label after " "alignment.",
+                n_nan,
             )
+        X = X.loc[valid_mask]
+        y = y.loc[valid_mask]
 
-        aligned_df = aligned_df[valid_mask]
+        if isinstance(y.dtype, pd.CategoricalDtype):
+            y = y.cat.remove_unused_categories()
 
-        if len(aligned_df) < 100:
+        if y.nunique() < 2:
             raise ValueError(
-                f"After PAM50 filtering, only {len(aligned_df)} samples remain. "
-                f"Check that valid_subtypes in IngestionConfig matches the "
-                f"actual label strings in your phenotype file."
+                f"After alignment, only {y.nunique()} distinct "
+                "label value(s) remain. Cannot proceed with "
+                "multi-class classification. Verify label column "
+                f"'{label_col}' is populated for the expected "
+                "samples."
             )
-
-        # Split into feature matrix X and label Series y
-        X = aligned_df.drop(columns=[self.config.label_column])
-        y = aligned_df[
-            self.config.label_column
-        ].cat.remove_unused_categories()  # Drop categories with 0 samples
 
         logger.info(
             "Alignment complete | X: %s | y distribution:\n%s",
             X.shape,
             y.value_counts().to_string(),
         )
-
         return X, y
 
     def _enforce_float32(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Downcast any float64 columns to float32 as a safety net.
 
-        This handles edge cases where pandas may internally promote dtypes
-        during the join operation (e.g., when a float32 column aligns with
-        a NaN-filled column, pandas may upcast to float64 to store NaN).
-
-        Iterates column-by-column rather than casting the entire DataFrame
-        at once to avoid a temporary full-copy memory spike.
+        The .loc[] subsetting in _align_samples() generally
+        preserves dtype and should not upcast, but this is retained
+        for defense in depth, matching preprocessing.py and
+        feature_selection.py.
 
         Args:
             df: Expression DataFrame post-alignment.
 
         Returns:
-            DataFrame with all float columns guaranteed to be float32.
+            DataFrame with all float columns guaranteed float32.
         """
         float64_cols = df.select_dtypes(include=["float64"]).columns
         if len(float64_cols) == 0:
-            logger.info("float32 check: all columns already float32. No action needed.")
+            logger.info("float32 check: all columns already float32.")
             return df
 
         logger.warning(
-            "Found %d float64 columns after alignment (likely from join NaN-fill). "
-            "Downcasting to float32...",
+            "Found %d float64 column(s) post-alignment. " "Downcasting to float32...",
             len(float64_cols),
         )
-
-        # Column-by-column to avoid peak memory spike from full DataFrame copy
         for col in float64_cols:
             df[col] = df[col].astype(np.float32)
 
         if self.config.low_memory_mode:
             gc.collect()
 
-        self.reporter.report(df, "Expression Matrix Post-Float32-Enforcement")
+        self.reporter.report(df, "X Post-Float32-Enforcement")
         return df
 
     def _validate_output(self, X: pd.DataFrame, y: pd.Series) -> None:
         """
-        Run sanity checks on the final (X, y) pair before returning to caller.
-
-        Catches common data quality issues that would silently corrupt
-        downstream preprocessing or modeling (e.g., all-zero columns,
-        unexpected NaN values, wrong dtype).
+        Run sanity checks on the final (X, y) pair before run()
+        returns it to the caller.
 
         Args:
             X: Final feature matrix.
@@ -590,126 +752,108 @@ class TCGADataIngester:
         Raises:
             ValueError: On any failed validation check.
         """
-        # Check 1: No NaN values in X
         nan_count = X.isnull().sum().sum()
         if nan_count > 0:
             raise ValueError(
-                f"Expression matrix contains {nan_count} NaN values after alignment. "
-                f"This may indicate a join issue. Run X.isnull().sum().sort_values() "
-                f"to identify affected genes."
+                f"Expression matrix contains {nan_count} NaN "
+                "values after alignment. Run "
+                "X.isnull().sum().sort_values() to find affected "
+                "genes."
             )
 
-        # Check 2: All expression columns are float32
         non_float32 = [col for col in X.columns if X[col].dtype != np.float32]
         if non_float32:
             raise ValueError(
-                f"{len(non_float32)} columns are not float32 after enforcement pass. "
-                f"First 5: {non_float32[:5]}"
+                f"{len(non_float32)} columns are not float32 "
+                f"after enforcement. First 5: {non_float32[:5]}"
             )
 
-        # Check 3: y has no NaN values
         y_nan = y.isnull().sum()
         if y_nan > 0:
             raise ValueError(
-                f"Label series contains {y_nan} NaN values. "
-                f"Alignment or filtering logic may have introduced gaps."
+                f"Label series contains {y_nan} NaN values "
+                "post-alignment. This should be unreachable -- "
+                "_align_samples() should have dropped these "
+                "already."
             )
 
-        # Check 4: At least 2 distinct classes
         n_classes = y.nunique()
         if n_classes < 2:
             raise ValueError(
-                f"Label series has only {n_classes} unique class(es). "
-                f"Cannot perform multi-class classification."
+                f"Label series has only {n_classes} unique "
+                "class(es). Cannot perform multi-class "
+                "classification."
             )
 
-        # Warning only: flag if any gene column is all-zero (not an error,
-        # but suspicious — may indicate a QC issue in the source data)
         zero_gene_cols = (X == 0).all(axis=0).sum()
         if zero_gene_cols > 0:
             logger.warning(
                 "%d gene columns are all-zero across all samples. "
-                "These will be removed by VarianceThreshold in preprocessing.",
+                "VarianceThreshold in preprocessing.py will remove "
+                "these.",
                 zero_gene_cols,
             )
 
-        logger.info("Validation passed: no NaN, correct dtype, %d classes.", n_classes)
+        logger.info(
+            "Validation passed: no NaN, correct dtype, %d classes.",
+            n_classes,
+        )
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ──
 
     def run(self) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
         """
         Execute the full ingestion pipeline end-to-end.
 
         Pipeline Stages:
-            1. Load expression matrix (Pass 1: inspect, Pass 2: full float32 load)
-            2. Load phenotype labels (PAM50 column only)
-            3. Align samples via inner join on TCGA barcodes
-            4. Free pre-alignment objects from memory
-            5. Enforce float32 dtype on all columns (safety net)
-            6. Validate final output
-            7. Compile and return metadata
+            1. Load expression matrix (float32, post-index_col).
+            2. Load phenotype labels (dynamic column detection,
+               strict TCGA-only cohort filter applied immediately).
+            3. Align samples: truncate barcodes, drop truncation
+               collisions, intersect indices, drop NaN labels.
+            4. Free pre-alignment objects from memory.
+            5. Enforce float32 dtype (safety net).
+            6. Validate final output.
+            7. Compile and return metadata.
 
         Returns:
-            Tuple of three objects:
-                X (pd.DataFrame): float32 expression matrix, shape (n_samples, n_genes).
-                    Row index: TCGA sample barcodes.
-                    Column names: Gene identifiers (Ensembl IDs or HUGO symbols).
-
-                y (pd.Series): Categorical PAM50 subtype labels, shape (n_samples,).
-                    dtype: CategoricalDtype with 5 ordered categories.
-
-                metadata (Dict[str, Any]): Pipeline run statistics including:
-                    - 'n_samples' (int): Samples in final X.
-                    - 'n_genes' (int): Genes/features in final X.
-                    - 'class_distribution' (Dict[str, int]): PAM50 counts per class.
-                    - 'memory_mb' (float): RAM used by final X in megabytes.
-                    - 'dtype_counts' (Dict[str, int]): Column dtype distribution.
+            Tuple of (X, y, metadata):
+                X: float32 DataFrame, shape (n_samples, n_genes).
+                y: category Series, detected subtype labels.
+                metadata: Dict with n_samples, n_genes,
+                    label_column_used, cohort_prefix,
+                    class_distribution, memory_mb, dtype_counts,
+                    data_dir.
 
         Raises:
             FileNotFoundError: If raw data files are missing.
+            KeyError: If barcode/label columns cannot be detected.
             ValueError: If alignment or validation fails.
-            MemoryError: If RAM is insufficient for float32 loading.
-
-        Example:
-            >>> ingester = TCGADataIngester(data_dir="data/raw/")
-            >>> X, y, meta = ingester.run()
-            >>> print(f"X: {X.shape}, dtype={X.dtypes.iloc[0]}")
-            >>> print(f"Memory: {meta['memory_mb']} MB")
-            >>> print(f"Classes: {y.value_counts().to_dict()}")
+            MemoryError: If RAM is insufficient.
         """
         logger.info("=" * 70)
         logger.info("TCGADataIngester.run() START")
         logger.info("=" * 70)
 
-        # ── Stage 1: Load raw files ───────────────────────────────────────────
         expr_df = self._load_expression_matrix()
         pheno_df = self._load_phenotype_labels()
 
-        # ── Stage 2: Align samples ────────────────────────────────────────────
         X, y = self._align_samples(expr_df, pheno_df)
 
-        # ── Stage 3: Free pre-alignment raw objects ───────────────────────────
-        # Critical: both expr_df and pheno_df are superseded by the aligned X, y.
-        # Releasing them before the enforcement pass keeps peak memory low.
         del expr_df, pheno_df
         if self.config.low_memory_mode:
             gc.collect()
-            logger.info(
-                "gc.collect() called after alignment — pre-alignment objects freed."
-            )
+            logger.info("gc.collect() called after alignment -- raw " "objects freed.")
 
-        # ── Stage 4: Enforce float32 (safety net post-join) ──────────────────
         X = self._enforce_float32(X)
-
-        # ── Stage 5: Validate ─────────────────────────────────────────────────
         self._validate_output(X, y)
 
-        # ── Stage 6: Compile metadata ─────────────────────────────────────────
         memory_stats = self.reporter.report(X, "Final Aligned X")
         metadata: Dict[str, Any] = {
             "n_samples": X.shape[0],
             "n_genes": X.shape[1],
+            "label_column_used": y.name,
+            "cohort_prefix": self.config.cohort_prefix,
             "class_distribution": y.value_counts().to_dict(),
             "memory_mb": memory_stats["total_mb"],
             "dtype_counts": memory_stats["dtype_counts"],
@@ -724,71 +868,60 @@ class TCGADataIngester:
             metadata["n_genes"],
             metadata["memory_mb"],
         )
+        logger.info("  Label column : %s", metadata["label_column_used"])
         logger.info("  Classes : %s", metadata["class_distribution"])
         logger.info("=" * 70)
 
         return X, y, metadata
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging Configuration Helper
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Logging Configuration Helper ──
 
 
 def setup_logging(level: str = "INFO") -> None:
     """
     Configure the root logger with a clean, structured format.
 
-    Call this once at the top of any script or notebook that imports
-    from this module. Downstream loggers (e.g., xgboost, shap) will
-    inherit this configuration.
+    Call this once at the top of any script or notebook that
+    imports from this module.
 
     Args:
-        level: Log level string. One of 'DEBUG', 'INFO', 'WARNING', 'ERROR'.
+        level: Log level string. One of 'DEBUG', 'INFO', 'WARNING',
+            'ERROR'.
     """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s",
+        format="%(asctime)s | %(levelname)-8s | %(name)-30s | " "%(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,  # Reconfigures if already set (useful in notebooks)
+        force=True,
     )
-    # Suppress verbose third-party logs that clutter output
     logging.getLogger("numexpr").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Standalone Entry Point (for manual testing in PyCharm Run configuration)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Standalone Entry Point ──
 
 if __name__ == "__main__":
-    """
-    Standalone execution for testing and debugging from PyCharm's Run button.
-
-    Configure PyCharm Run/Debug:
-        Script: src/data_ingestion.py
-        Working directory: <project root>
-    """
     setup_logging("INFO")
 
-    # ── Run ingestion ─────────────────────────────────────────────────────────
     ingester = TCGADataIngester(data_dir="data/raw/")
     X, y, metadata = ingester.run()
 
-    # ── Summary output ────────────────────────────────────────────────────────
     sep = "=" * 60
     print(f"\n{sep}")
-    print("  INGESTION COMPLETE — SUMMARY")
+    print("  INGESTION COMPLETE -- SUMMARY")
     print(sep)
-    print(f"  X shape     : {X.shape}")
-    print(f"  X dtype     : {X.dtypes.iloc[0]}")
-    print(f"  y shape     : {y.shape}")
-    print(f"  Memory (X)  : {metadata['memory_mb']} MB")
-    print("  Classes     :")
+    print(f"  X shape       : {X.shape}")
+    print(f"  X dtype       : {X.dtypes.iloc[0]}")
+    print(f"  y shape       : {y.shape}")
+    print(f"  Label column  : {metadata['label_column_used']}")
+    print(f"  Cohort prefix : {metadata['cohort_prefix']}")
+    print(f"  Memory (X)    : {metadata['memory_mb']} MB")
+    print("  Classes       :")
     for cls, count in sorted(metadata["class_distribution"].items()):
         pct = 100 * count / y.shape[0]
-        bar = "█" * int(pct / 3)
-        print(f"    {cls:<10} : {count:4d} ({pct:5.1f}%)  {bar}")
+        bar = "#" * int(pct / 3)
+        print(f"    {cls!s:<12} : {count:4d} ({pct:5.1f}%)  {bar}")
     print(sep)
-    print("\n  ✓ X and y are ready to pass to src/preprocessing.py")
+    print("\n  X and y ready for src/preprocessing.py")
     print(sep)
