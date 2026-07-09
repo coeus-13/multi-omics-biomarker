@@ -549,6 +549,8 @@ class BiomarkerEnsemble:
             )
 
 
+BiomarkerEnsemble.__module__ = "src.models.ensemble_model"
+
 # ── Standalone Entry Point ──
 
 if __name__ == "__main__":

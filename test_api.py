@@ -1,0 +1,241 @@
+"""
+test_api.py
+===========
+Standalone smoke test for the live FastAPI vital-status prediction
+service (src/api/main.py). Run this in a second terminal while the
+API is running in the first.
+
+NOT A UNIT TEST
+--------------------
+Despite the filename, this is a manual, network-calling smoke test
+against a live server -- not a pytest module. It is deliberately
+kept out of tests/, which is reserved for pytest-discovered unit
+tests against synthetic fixtures with no running server and no
+network calls (see tests/conftest.py). Everything here lives inside
+functions guarded by if __name__ == "__main__", so nothing executes
+at import time even if pytest happens to collect this file -- but
+placing it in tests/ would still invite confusion given the
+filename overlaps pytest's own test_*.py discovery convention.
+
+THIS IS A WIRING TEST, NOT A SCIENTIFIC ONE
+------------------------------------------------
+The dummy payload is uniform random noise across every gene, which
+looks nothing like real FPKM-UQ expression data (heavily right-
+skewed in reality -- most genes near zero, a few highly expressed).
+This confirms the HTTP round-trip, Pydantic validation, and the
+full preprocessor -> selector -> ensemble chain execute without
+error. It says nothing about whether the returned risk_probability
+is meaningful. Don't read biology into this response.
+
+DEPENDENCY NOTE
+--------------------
+requests is not currently in requirements.txt or requirements-
+dev.txt:
+    pip install requests
+It belongs in requirements-dev.txt -- the API server itself never
+imports requests; only this client does.
+
+Usage:
+    Terminal 1: python src/api/main.py
+    Terminal 2: python test_api.py
+
+Author: [Your Name]
+Date  : [Project Date]
+"""
+
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+import requests
+
+from src.preprocessing import GenomicsPreprocessor
+
+API_URL = "http://localhost:8000"
+PREPROCESSOR_PATH = "models/preprocessing_pipeline.joblib"
+RANDOM_SEED = 42
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+def load_expected_genes(preprocessor_path: str) -> List[str]:
+    """
+    Load the fitted preprocessing pipeline and extract the exact
+    raw gene panel it was fit on.
+
+    Mirrors src/api/main.py's own _load_artifacts() so this script
+    independently reconstructs the same expected-gene list the
+    live API uses -- no dependency on calling /health first.
+
+    Args:
+        preprocessor_path: Path to preprocessing_pipeline.joblib.
+
+    Returns:
+        Gene identifiers, in the exact column order the
+        preprocessor expects.
+
+    Raises:
+        FileNotFoundError: If the artifact is missing.
+    """
+    path = Path(preprocessor_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Preprocessing artifact not found: {path}\n"
+            "Run the training pipeline before this smoke test."
+        )
+
+    preprocessor = GenomicsPreprocessor.load(str(path))
+    log2_step = preprocessor.pipeline_.named_steps["log2_transform"]
+    return list(log2_step.feature_names_in_)
+
+
+def build_dummy_payload(
+    expected_genes: List[str], patient_id: str, seed: int
+) -> Dict[str, Any]:
+    """
+    Build a synthetic /predict payload: every expected gene mapped
+    to a random float in [0.5, 10.0).
+
+    Vectorized generation: one rng.uniform() call over the full
+    gene count, not a Python loop calling it once per gene.
+    .tolist() converts numpy.float64 -> native Python float, which
+    is required for JSON serialization -- requests' json= parameter
+    uses the stdlib json module, which does not know how to
+    serialize numpy scalar types and will raise TypeError otherwise.
+
+    Args:
+        expected_genes: Full raw gene panel, in order.
+        patient_id: Identifier to attach to this synthetic patient.
+        seed: Seed for reproducibility across repeated runs.
+
+    Returns:
+        Dict matching the PatientProfile request schema.
+    """
+    rng = np.random.default_rng(seed)
+    random_values = rng.uniform(0.5, 10.0, size=len(expected_genes))
+
+    return {
+        "patient_id": patient_id,
+        "expressions": dict(zip(expected_genes, random_values.tolist())),
+    }
+
+
+def check_server_health(base_url: str) -> bool:
+    """
+    Best-effort GET /health check before attempting /predict, so a
+    down server produces a clear message rather than a raw
+    connection error buried under a large POST attempt.
+
+    Args:
+        base_url: e.g. 'http://localhost:8000'.
+
+    Returns:
+        True if the server responded 200 with models_loaded=True.
+        Never raises -- failure here is advisory, not fatal;
+        send_prediction_request() still runs its own full error
+        handling regardless of this result.
+    """
+    try:
+        response = requests.get(f"{base_url}/health", timeout=5)
+    except requests.exceptions.RequestException:
+        return False
+
+    if response.status_code != 200:
+        return False
+
+    try:
+        return bool(response.json().get("models_loaded", False))
+    except ValueError:
+        return False
+
+
+def send_prediction_request(base_url: str, payload: Dict[str, Any]) -> None:
+    """
+    POST payload to /predict and print the formatted response.
+
+    Distinguishes connection failure, timeout, and non-200
+    responses so the failure mode is obvious from the printed
+    message alone.
+
+    Args:
+        base_url: e.g. 'http://localhost:8000'.
+        payload: Dict matching the PatientProfile request schema.
+    """
+    url = f"{base_url}/predict"
+    n_genes = len(payload["expressions"])
+    print(f"POST {url}  ({n_genes:,} genes in payload)")
+
+    try:
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    except requests.exceptions.ConnectionError:
+        print(
+            "\nERROR: could not connect to the API.\n"
+            "Is 'src/api/main.py' running and listening on "
+            f"{base_url}?"
+        )
+        return
+    except requests.exceptions.Timeout:
+        print(
+            "\nERROR: request timed out after "
+            f"{REQUEST_TIMEOUT_SECONDS}s. The server may be "
+            "overloaded or stuck."
+        )
+        return
+    except requests.exceptions.RequestException as exc:
+        print(f"\nERROR: request failed unexpectedly: {exc}")
+        return
+
+    print(f"Status: {response.status_code}\n")
+
+    try:
+        body = response.json()
+    except ValueError:
+        print("Response was not valid JSON:")
+        print(response.text)
+        return
+
+    print(json.dumps(body, indent=2))
+
+    if response.status_code != 200:
+        print(
+            f"\nNOTE: server returned HTTP {response.status_code}, "
+            "not 200 -- see 'detail' above for the reason."
+        )
+
+
+def main() -> None:
+    print("=" * 60)
+    print("  API SMOKE TEST -- /predict")
+    print("=" * 60)
+
+    print(f"\nChecking {API_URL}/health ...")
+    if check_server_health(API_URL):
+        print("Server is up and models are loaded.")
+    else:
+        print(
+            "WARNING: /health check failed or reported "
+            "models_loaded=False. Attempting /predict anyway."
+        )
+
+    print(f"\nLoading expected gene panel from {PREPROCESSOR_PATH} ...")
+    try:
+        expected_genes = load_expected_genes(PREPROCESSOR_PATH)
+    except FileNotFoundError as exc:
+        print(f"\nERROR: {exc}")
+        sys.exit(1)
+
+    print(f"Loaded {len(expected_genes):,} expected genes.")
+
+    payload = build_dummy_payload(
+        expected_genes, patient_id="TEST-001", seed=RANDOM_SEED
+    )
+
+    print()
+    send_prediction_request(API_URL, payload)
+
+    print("\n" + "=" * 60)
+
+
+if __name__ == "__main__":
+    main()
