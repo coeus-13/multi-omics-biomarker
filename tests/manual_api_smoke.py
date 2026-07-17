@@ -1,21 +1,22 @@
 """
-test_api.py
-===========
+manual_api_smoke.py
+====================
 Standalone smoke test for the live FastAPI vital-status prediction
 service (src/api/main.py). Run this in a second terminal while the
 API is running in the first.
 
-NOT A UNIT TEST
---------------------
-Despite the filename, this is a manual, network-calling smoke test
-against a live server -- not a pytest module. It is deliberately
-kept out of tests/, which is reserved for pytest-discovered unit
-tests against synthetic fixtures with no running server and no
-network calls (see tests/conftest.py). Everything here lives inside
-functions guarded by if __name__ == "__main__", so nothing executes
-at import time even if pytest happens to collect this file -- but
-placing it in tests/ would still invite confusion given the
-filename overlaps pytest's own test_*.py discovery convention.
+NOT A PYTEST FILE -- NAMED DELIBERATELY TO AVOID DISCOVERY
+------------------------------------------------------------------
+This is a manual, network-calling smoke test against a live
+server. It lives in tests/ for organizational consistency, but is
+deliberately named to avoid pytest's default discovery globs
+(test_*.py, *_test.py) -- a file matching those patterns would be
+imported during `pytest tests/`, and while none of its functions
+are named test_* (so nothing would actually run), it's a needless
+foot-gun to leave in place. Naming it out of the glob is a
+structural guarantee that can't drift, unlike a conftest.py
+exclusion rule -- the same lesson learned from the E203 CI/pre-
+commit config drift earlier in this project.
 
 THIS IS A WIRING TEST, NOT A SCIENTIFIC ONE
 ------------------------------------------------
@@ -29,15 +30,13 @@ is meaningful. Don't read biology into this response.
 
 DEPENDENCY NOTE
 --------------------
-requests is not currently in requirements.txt or requirements-
-dev.txt:
-    pip install requests
-It belongs in requirements-dev.txt -- the API server itself never
-imports requests; only this client does.
+requests is not in requirements.txt -- it belongs in
+requirements-dev.txt, since the API server itself never imports
+it; only this client does.
 
 Usage:
     Terminal 1: python src/api/main.py
-    Terminal 2: python test_api.py
+    Terminal 2: python tests/manual_api_smoke.py
 
 Author: [Your Name]
 Date  : [Project Date]
