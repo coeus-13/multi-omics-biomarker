@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Omics Cancer Biomarker Discovery — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+
+    <!-- ============ HEADER ============ -->
+    <header class="site-header">
+      <div class="header-inner">
+        <p class="eyebrow">Research Dashboard</p>
+        <h1>Multi-Omics Cancer Biomarker Discovery</h1>
+        <!-- Tagline and pill text are set in script.js, not hardcoded
+             here -- see renderHeader(). Keeps all project facts in one
+             place (the data objects) instead of split across two files. -->
+        <p id="project-tagline" class="tagline"></p>
+        <div id="key-finding-pill" class="pill"></div>
+      </div>
+    </header>
+
+    <main>
+      <!-- ============ DATA OVERVIEW ============ -->
+      <section class="section" id="overview-section" aria-labelledby="overview-heading">
+        <p class="section-eyebrow">Data Overview</p>
+        <h2 id="overview-heading">What went into the model</h2>
+        <p class="section-intro">
+          RNA-Seq gene expression and clinical outcome data from the
+          TCGA-BRCA breast cancer cohort, sourced via the GDC Hub.
+        </p>
+
+        <div class="stat-row" id="overview-stats"></div>
+
+        <div class="funnel" id="gene-funnel" aria-label="Gene panel reduction, raw to final"></div>
+      </section>
+
+      <!-- ============ RESULTS ============ -->
+      <section class="section" id="results-section" aria-labelledby="results-heading">
+        <p class="section-eyebrow">Model Results</p>
+        <h2 id="results-heading">Stacking ensemble performance</h2>
+        <p class="section-intro">
+          Random Forest and XGBoost base learners feeding a Logistic
+          Regression meta-learner, evaluated on a held-out test split.
+        </p>
+
+        <div class="results-grid">
+          <div class="metric-row" id="metrics-container"></div>
+
+          <div class="panel-card">
+            <div class="panel-card-header">
+              <h3>Biomarker Panel</h3>
+              <span id="panel-count" class="panel-count-badge"></span>
+            </div>
+            <p class="panel-card-note">
+              Selected via MAD filtering + ANOVA F-test
+              (<code>SelectKBest</code>). Ranked by mean |SHAP|.
+            </p>
+            <ul class="gene-list" id="gene-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ EXPLAINABILITY ============ -->
+      <section class="section" id="explainability-section" aria-labelledby="explainability-heading">
+        <p class="section-eyebrow">Explainability</p>
+        <h2 id="explainability-heading">What the model actually learned</h2>
+        <p class="section-intro">
+          Exact Tree SHAP on the XGBoost base learner, run against the
+          100-gene biomarker panel.
+        </p>
+
+        <div class="explain-grid">
+          <div class="shap-plot-card">
+            <h3>SHAP Beeswarm Plot</h3>
+            <div class="image-frame">
+              <img
+                id="shap-plot-image"
+                src="../reports/figures/shap_beeswarm_vital_status.png"
+                alt="SHAP beeswarm plot showing per-gene impact on predicted vital status"
+              />
+              <!-- Shown by script.js only if the image above fails to
+                   load -- see wireImageFallback(). Hidden by default via
+                   the `hidden` attribute, not CSS, so it's invisible even
+                   before style.css finishes loading. -->
+              <div id="shap-plot-fallback" class="image-fallback" hidden>
+                <p>Beeswarm plot not found here.</p>
+                <p class="image-fallback-path">
+                  Expected at
+                  <code>reports/figures/shap_beeswarm_vital_status.png</code>
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Fully populated by script.js -- see renderFindingCard() -->
+          <div class="finding-card" id="finding-card"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>Built with vanilla HTML, CSS &amp; JavaScript — no frameworks.</p>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

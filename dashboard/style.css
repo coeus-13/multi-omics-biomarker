@@ -1,0 +1,528 @@
+/* ==========================================================================
+   TOKENS
+   -- Palette is deliberately drawn from SHAP's own color convention
+   (blue = one direction, coral = the other) rather than an arbitrary
+   dark-mode accent, since that gradient is literally the visual
+   language of the beeswarm plot this dashboard is built around.
+   ========================================================================== */
+:root {
+  --bg-primary: #0a0e16;
+  --bg-panel: #10151f;
+  --bg-panel-raised: #161d2b;
+  --border: #232b3d;
+  --border-strong: #33405a;
+
+  --text-primary: #e7ebf3;
+  --text-secondary: #8b97ad;
+  --text-tertiary: #5c6a82;
+
+  --accent-blue: #4d8de0;
+  --accent-blue-dim: rgba(77, 141, 224, 0.14);
+  --accent-coral: #ef5c73;
+  --accent-coral-dim: rgba(239, 92, 115, 0.14);
+
+  --font-display: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-body: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+
+  --space-xs: 0.5rem;
+  --space-sm: 1rem;
+  --space-md: 1.75rem;
+  --space-lg: 3rem;
+  --space-xl: 5rem;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --max-width: 1120px;
+}
+
+/* ==========================================================================
+   RESET & BASE
+   ========================================================================== */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  line-height: 1.15;
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+.page {
+  animation: fade-in 0.6s ease-out;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+a:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, .page {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ==========================================================================
+   HEADER
+   ========================================================================== */
+.site-header {
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-xl) var(--space-md) var(--space-lg);
+}
+
+.header-inner {
+  max-width: var(--max-width);
+  margin: 0 auto;
+}
+
+.eyebrow,
+.section-eyebrow {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  margin-bottom: var(--space-xs);
+}
+
+.site-header h1 {
+  font-size: clamp(1.75rem, 4vw, 2.75rem);
+  font-weight: 700;
+  max-width: 20ch;
+}
+
+.tagline {
+  color: var(--text-secondary);
+  font-size: 1.05rem;
+  margin-top: var(--space-sm);
+  max-width: 52ch;
+}
+
+.pill {
+  display: inline-block;
+  margin-top: var(--space-md);
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--accent-coral);
+  background: var(--accent-coral-dim);
+  color: var(--accent-coral);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  border-radius: 999px;
+}
+
+/* ==========================================================================
+   SECTION SHELL
+   ========================================================================== */
+.section {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: var(--space-xl) var(--space-md);
+  border-bottom: 1px solid var(--border);
+}
+
+.section h2 {
+  font-size: clamp(1.4rem, 2.6vw, 1.9rem);
+  font-weight: 600;
+  margin-bottom: var(--space-sm);
+}
+
+.section-intro {
+  color: var(--text-secondary);
+  max-width: 58ch;
+  margin-bottom: var(--space-lg);
+}
+
+/* ==========================================================================
+   OVERVIEW: STAT CARDS + FUNNEL
+   ========================================================================== */
+.stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-lg);
+}
+
+.stat-card {
+  flex: 1 1 200px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.stat-label {
+  margin-top: var(--space-xs);
+  font-weight: 500;
+}
+
+.stat-note {
+  color: var(--text-tertiary);
+  font-size: 0.85rem;
+  margin-top: 0.2rem;
+}
+
+.funnel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+.funnel-step {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  text-align: center;
+  min-width: 140px;
+}
+
+.funnel-genes {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.funnel-stage {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+.funnel-arrow {
+  color: var(--text-tertiary);
+  font-size: 1.1rem;
+}
+
+/* ==========================================================================
+   RESULTS: METRICS + GENE PANEL
+   ========================================================================== */
+.results-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: var(--space-lg);
+  align-items: start;
+}
+
+.metric-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.metric-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+}
+
+.metric-value {
+  font-family: var(--font-mono);
+  font-size: 2rem;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.metric-label {
+  margin-top: 0.2rem;
+  font-weight: 500;
+}
+
+.metric-note {
+  color: var(--text-tertiary);
+  font-size: 0.82rem;
+  margin-top: 0.2rem;
+}
+
+.panel-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+}
+
+.panel-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-xs);
+}
+
+.panel-count-badge {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.panel-card-note {
+  color: var(--text-tertiary);
+  font-size: 0.85rem;
+  margin-bottom: var(--space-sm);
+}
+
+.panel-card-note code {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.gene-list {
+  list-style: none;
+  max-height: 360px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.gene-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0.65rem 0.25rem;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.gene-row:hover {
+  background-color: var(--bg-panel-raised);
+}
+
+.gene-symbol {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  margin-right: var(--space-xs);
+}
+
+.gene-ensembl {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.gene-shap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.gene-shap-value {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  min-width: 4.5ch;
+  text-align: right;
+}
+
+.gene-shap--alive .gene-shap-value { color: var(--accent-blue); }
+.gene-shap--dead .gene-shap-value { color: var(--accent-coral); }
+
+/* ==========================================================================
+   EXPLAINABILITY
+   ========================================================================== */
+.explain-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr;
+  gap: var(--space-lg);
+  align-items: start;
+}
+
+.shap-plot-card h3,
+.finding-symbol {
+  margin-bottom: var(--space-sm);
+}
+
+.image-frame {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-fallback {
+  text-align: center;
+  color: var(--text-secondary);
+  padding: var(--space-lg) var(--space-sm);
+}
+
+.image-fallback-path {
+  margin-top: var(--space-xs);
+  font-size: 0.85rem;
+}
+
+.image-fallback-path code {
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+}
+
+.finding-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--accent-coral);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+}
+
+.finding-eyebrow {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent-coral);
+  margin-bottom: 0.3rem;
+}
+
+.finding-card--protective {
+  border-color: var(--accent-blue);
+}
+
+.finding-card--protective .finding-eyebrow {
+  color: var(--accent-blue);
+}
+.finding-symbol {
+  font-family: var(--font-mono);
+  font-size: 2rem;
+  font-weight: 600;
+}
+
+.finding-fullname {
+  color: var(--text-secondary);
+  margin-bottom: var(--space-sm);
+}
+
+.finding-role {
+  font-size: 0.92rem;
+  margin-bottom: var(--space-md);
+}
+
+.finding-stats {
+  display: flex;
+  gap: var(--space-lg);
+  margin-bottom: var(--space-md);
+}
+
+.finding-stat-label {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 0.78rem;
+}
+
+.finding-stat-value {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-top: 0.15rem;
+}
+
+.finding-bar-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.finding-bar-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
+/* ==========================================================================
+   SIGNATURE ELEMENT: SHAP DIRECTION BAR
+   -- Reused wherever a signed SHAP value appears (finding card,
+   every gene-list row). Track is a fixed blue-to-coral gradient;
+   the marker's horizontal position is the only thing JS computes
+   per value -- see shapToPercent() in script.js.
+   ========================================================================== */
+.shap-bar-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--accent-blue) 0%,
+    var(--border-strong) 50%,
+    var(--accent-coral) 100%
+  );
+}
+
+.shap-bar-marker {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  border: 2px solid var(--bg-panel);
+  transform: translate(-50%, -50%);
+}
+
+.shap-bar--sm {
+  width: 48px;
+}
+
+.shap-bar--sm .shap-bar-track {
+  height: 5px;
+}
+
+.shap-bar--sm .shap-bar-marker {
+  width: 9px;
+  height: 9px;
+}
+
+/* ==========================================================================
+   FOOTER
+   ========================================================================== */
+.site-footer {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: var(--space-lg) var(--space-md);
+  color: var(--text-tertiary);
+  font-size: 0.85rem;
+}
+
+/* ==========================================================================
+   RESPONSIVE
+   ========================================================================== */
+@media (max-width: 760px) {
+  .results-grid,
+  .explain-grid {
+    grid-template-columns: 1fr;
+  }
+}
